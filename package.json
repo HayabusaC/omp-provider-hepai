@@ -1,6 +1,6 @@
 {
   "name": "omp-provider-hepai",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "HepAI provider with live model discovery and protocol diagnostics for OMP.",
   "type": "module",
   "license": "MIT",
@@ -31,5 +31,5 @@
     "@types/bun": "^1.3.14",
     "typescript": "^5.9.3"
   },
-  "files": ["index.ts", "capabilities.ts", "README.md", "LICENSE"]
+  "files": ["index.ts", "capabilities.ts", "portal-auth.ts", "README.md", "LICENSE"]
 }

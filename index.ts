@@ -24,6 +24,15 @@ import {
   type ProbeEndpoint,
   type ProbeResult,
 } from "./capabilities.ts";
+import {
+  loginPortalWithPassword,
+  loginPortalWithSso,
+  PORTAL_PASSWORD_PROVIDER,
+  PORTAL_SSO_PROVIDER,
+  portalAccessToken,
+  refreshPortalPassword,
+  refreshPortalSso,
+} from "./portal-auth.ts";
 
 const PROVIDER = "hepai";
 const API = "hepai-auto";
@@ -182,6 +191,25 @@ export default function hepAIProvider(omp: ExtensionAPI): void {
     fetchDynamicModels: discover,
   });
 
+  // Portal authentication is intentionally separate from the model API-key provider.
+  // Both flows use OMP's native /login UI and AuthStorage persistence.
+  omp.registerProvider(PORTAL_PASSWORD_PROVIDER, {
+    oauth: {
+      name: "HepAI Portal (username/password)",
+      login: loginPortalWithPassword,
+      refreshToken: refreshPortalPassword,
+      getApiKey: portalAccessToken,
+    },
+  });
+  omp.registerProvider(PORTAL_SSO_PROVIDER, {
+    oauth: {
+      name: "HepAI Portal (IHEP SSO — no saved password)",
+      login: loginPortalWithSso,
+      refreshToken: refreshPortalSso,
+      getApiKey: portalAccessToken,
+    },
+  });
+
   omp.registerCommand("hepai-login", {
     description: "Save a HepAI API key in OMP AuthStorage",
     handler: async (_args, ctx) => {
@@ -215,6 +243,18 @@ export default function hepAIProvider(omp: ExtensionAPI): void {
       if (preferred) protocolCache.set(model, preferred);
       const summary = results.map(result => `${result.endpoint}: ${result.kind} (HTTP ${result.status})`).join("; ");
       ctx.ui.notify(`${model} — ${summary}`, supported.length > 0 ? "info" : "warning");
+    },
+  });
+
+  omp.registerCommand("hepai-portal-auth", {
+    description: "Show HepAI Portal password and SSO login entry points",
+    handler: async (_args, ctx) => {
+      const password = ctx.modelRegistry.authStorage.hasAuth(PORTAL_PASSWORD_PROVIDER) ? "saved" : "not configured";
+      const sso = ctx.modelRegistry.authStorage.hasAuth(PORTAL_SSO_PROVIDER) ? "saved" : "not configured";
+      ctx.ui.notify(
+        `Portal auth — password: ${password}; SSO: ${sso}. Use /login ${PORTAL_PASSWORD_PROVIDER} or /login ${PORTAL_SSO_PROVIDER}.`,
+        "info",
+      );
     },
   });
 }
