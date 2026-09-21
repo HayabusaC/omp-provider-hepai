@@ -47,7 +47,7 @@ export function classifyProbe(endpoint: ProbeResult["endpoint"], status: number,
   if (status >= 200 && status < 300) return { endpoint, kind: "supported", status, detail: "ok" };
   if (status === 401 || status === 403) return { endpoint, kind: "auth-failed", status, detail };
   if (status >= 500) return { endpoint, kind: "upstream-error", status, detail };
-  if (/model|not support|unsupported|not available|permission/iu.test(text)) {
+  if (/model|not support|unsupported|not available|permission|模型.*不支持|不支持.*协议/iu.test(text)) {
     return { endpoint, kind: "model-unsupported", status, detail };
   }
   if (status === 404 || status === 405) return { endpoint, kind: "endpoint-missing", status, detail };
@@ -57,5 +57,5 @@ export function classifyProbe(endpoint: ProbeResult["endpoint"], status: number,
 export function shouldFallbackStatus(status: number | undefined, message: string): boolean {
   if (status === 401 || status === 403 || (status !== undefined && status >= 500)) return false;
   return status === 404 || status === 405 || status === 400 || status === 422 ||
-    /responses?.*(?:unsupported|not supported|not found)|model.*(?:unsupported|not available)/iu.test(message);
+    /responses?.*(?:unsupported|not supported|not found)|model.*(?:unsupported|not available)|模型.*不支持|不支持.*协议/iu.test(message);
 }

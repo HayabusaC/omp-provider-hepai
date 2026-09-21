@@ -1,10 +1,9 @@
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oauth/types";
+import { HEPAI_BASE_URL } from "./endpoints.ts";
 
-export const PORTAL_PASSWORD_PROVIDER = "hepai-portal-password";
 export const PORTAL_SSO_PROVIDER = "hepai-portal-sso";
-export const PORTAL_BASE_URL = "https://aiapi.ihep.ac.cn/apiv2";
+export const PORTAL_BASE_URL = HEPAI_BASE_URL;
 
-const PASSWORD_REFRESH_VERSION = 1;
 const FALLBACK_TOKEN_LIFETIME_MS = 5 * 60_000;
 const REFRESH_COOKIE_NAME = "refresh-token";
 
@@ -18,12 +17,6 @@ interface PortalTokenResponse {
   access_token?: unknown;
   token_type?: unknown;
   user?: PortalUser;
-}
-
-interface PasswordRefreshSecret {
-  version: typeof PASSWORD_REFRESH_VERSION;
-  username: string;
-  password: string;
 }
 
 type Fetcher = NonNullable<OAuthLoginCallbacks["fetch"]>;
@@ -52,7 +45,28 @@ function identity(user: PortalUser | undefined): Pick<OAuthCredentials, "email" 
 }
 
 async function parseTokenResponse(response: Response, operation: string): Promise<PortalTokenResponse & { access_token: string }> {
-  if (!response.ok) throw new Error(`HepAI Portal ${operation} failed with HTTP ${response.status}`);
+  if (!response.ok) {
+    let serverDetail = "";
+    try {
+      const payload = await response.json() as { detail?: unknown };
+      const detail = payload.detail;
+      if (detail && typeof detail === "object") {
+        const code = (detail as { code?: unknown }).code;
+        const message = (detail as { message?: unknown }).message;
+        const safeCode = typeof code === "number" || typeof code === "string" ? String(code).slice(0, 32) : "";
+        const safeMessage = typeof message === "string" ? message.replace(/[\r\n\t]/g, " ").slice(0, 160) : "";
+        serverDetail = [safeCode, safeMessage].filter(Boolean).join(": ");
+      } else if (typeof detail === "string") {
+        serverDetail = detail.replace(/[\r\n\t]/g, " ").slice(0, 160);
+      }
+    } catch {
+      // HTTP status remains authoritative when the server error body is absent or malformed.
+    }
+    throw new Error(
+      `HepAI Portal ${operation} failed with HTTP ${response.status}`
+      + (serverDetail ? ` (${serverDetail})` : "")
+    );
+  }
   let payload: PortalTokenResponse;
   try {
     payload = await response.json() as PortalTokenResponse;
@@ -65,77 +79,22 @@ async function parseTokenResponse(response: Response, operation: string): Promis
   return { ...payload, access_token: payload.access_token };
 }
 
-async function passwordToken(
-  username: string,
-  password: string,
-  fetchImpl: Fetcher,
-  signal?: AbortSignal,
-): Promise<PortalTokenResponse & { access_token: string }> {
-  const response = await fetchImpl(`${PORTAL_BASE_URL}/portal/user/login`, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
-    body: new URLSearchParams({ username, password }),
-    signal,
-    redirect: "error",
-  });
-  return parseTokenResponse(response, "password login");
-}
-
-function encodePasswordSecret(username: string, password: string): string {
-  return JSON.stringify({ version: PASSWORD_REFRESH_VERSION, username, password } satisfies PasswordRefreshSecret);
-}
-
-function decodePasswordSecret(value: string): PasswordRefreshSecret {
-  let secret: unknown;
-  try { secret = JSON.parse(value); } catch { throw new Error("Stored HepAI Portal password credential is invalid"); }
-  if (!secret || typeof secret !== "object") throw new Error("Stored HepAI Portal password credential is invalid");
-  const candidate = secret as Partial<PasswordRefreshSecret>;
-  if (
-    candidate.version !== PASSWORD_REFRESH_VERSION
-    || typeof candidate.username !== "string"
-    || !candidate.username
-    || typeof candidate.password !== "string"
-    || !candidate.password
-  ) throw new Error("Stored HepAI Portal password credential is invalid");
-  return candidate as PasswordRefreshSecret;
-}
-
-function passwordCredentials(
-  token: PortalTokenResponse & { access_token: string },
-  username: string,
-  password: string,
-): OAuthCredentials {
-  return {
-    access: token.access_token,
-    refresh: encodePasswordSecret(username, password),
-    expires: tokenExpiry(token.access_token),
-    ...identity(token.user),
-  };
-}
-
-export async function loginPortalWithPassword(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-  const username = (await callbacks.onPrompt({ message: "HepAI Portal username:", placeholder: "username" })).trim();
-  if (!username) throw new Error("HepAI Portal username is required");
-  const password = await callbacks.onPrompt({ message: "HepAI Portal password:", secret: true });
-  if (!password) throw new Error("HepAI Portal password is required");
-  callbacks.onProgress?.("Signing in to HepAI Portal...");
-  const token = await passwordToken(username, password, callbacks.fetch ?? fetch, callbacks.signal);
-  return passwordCredentials(token, username, password);
-}
-
-export async function refreshPortalPassword(
-  credentials: OAuthCredentials,
-  signal?: AbortSignal,
-): Promise<OAuthCredentials> {
-  const secret = decodePasswordSecret(credentials.refresh);
-  const token = await passwordToken(secret.username, secret.password, fetch, signal);
-  return { ...passwordCredentials(token, secret.username, secret.password), ...identity(token.user), authorizedAt: credentials.authorizedAt };
-}
-
 function validateRefreshCookie(value: string): string {
   const cookie = value.trim();
   if (!cookie || /[\s;]/.test(cookie)) throw new Error("HepAI Portal SSO returned an invalid refresh cookie");
   return cookie;
+}
+
+function explainBrowserNetworkFailure(error: unknown): never {
+  const message = error instanceof Error ? error.message : String(error);
+  const code = message.match(/ERR_(?:CONNECTION_CLOSED|PROXY_CONNECTION_FAILED|TUNNEL_CONNECTION_FAILED|SSL_PROTOCOL_ERROR)/)?.[0];
+  if (code) {
+    throw new Error(
+      `HepAI Portal SSO browser could not reach aiapi.ihep.ac.cn (${code}). `
+      + "Check the system browser proxy or bypass aiapi.ihep.ac.cn and newlogin.ihep.ac.cn, then retry.",
+    );
+  }
+  throw error;
 }
 
 async function refreshCookieToken(
@@ -143,12 +102,34 @@ async function refreshCookieToken(
   fetchImpl: Fetcher,
   signal?: AbortSignal,
 ): Promise<PortalTokenResponse & { access_token: string }> {
-  const response = await fetchImpl(`${PORTAL_BASE_URL}/portal/user/refresh`, {
+  const request = (url: string) => fetchImpl(url, {
     method: "GET",
     headers: { Cookie: `${REFRESH_COOKIE_NAME}=${refreshCookie}`, Accept: "application/json" },
     signal,
     redirect: "error",
   });
+  let response = await request(`${PORTAL_BASE_URL}/portal/user/refresh`);
+  // The 2026-09-21 production deployment mistakenly exposed an unbound `self`
+  // argument as a required query parameter. Keep the documented request first,
+  // then use the narrow workaround only for that exact FastAPI validation error.
+  if (response.status === 422) {
+    try {
+      const payload = await response.clone().json() as { detail?: unknown };
+      const errors = Array.isArray(payload.detail) ? payload.detail : [];
+      const missingSelf = errors.some(error => {
+        if (!error || typeof error !== "object") return false;
+        const candidate = error as { type?: unknown; loc?: unknown };
+        return candidate.type === "missing"
+          && Array.isArray(candidate.loc)
+          && candidate.loc.length === 2
+          && candidate.loc[0] === "query"
+          && candidate.loc[1] === "self";
+      });
+      if (missingSelf) response = await request(`${PORTAL_BASE_URL}/portal/user/refresh?self=1`);
+    } catch {
+      // Preserve the original response for normal error handling.
+    }
+  }
   return parseTokenResponse(response, "SSO refresh");
 }
 
@@ -171,10 +152,16 @@ function ssoCredentials(
 export async function loginPortalWithSso(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
   if (!callbacks.onBrowserSession) throw new Error("HepAI Portal SSO requires an OMP client with browser-session login support");
   callbacks.onProgress?.("Complete IHEP unified authentication in the browser window.");
-  const refreshCookie = validateRefreshCookie(await callbacks.onBrowserSession({
-    url: `${PORTAL_BASE_URL}/portal/user/login_sso`,
-    cookieNames: [REFRESH_COOKIE_NAME],
-  }, callbacks.signal));
+  let capturedCookie: string;
+  try {
+    capturedCookie = await callbacks.onBrowserSession({
+      url: `${PORTAL_BASE_URL}/portal/user/login_sso`,
+      cookieNames: [REFRESH_COOKIE_NAME],
+    }, callbacks.signal);
+  } catch (error) {
+    explainBrowserNetworkFailure(error);
+  }
+  const refreshCookie = validateRefreshCookie(capturedCookie);
   callbacks.onProgress?.("Validating the HepAI Portal session...");
   const token = await refreshCookieToken(refreshCookie, callbacks.fetch ?? fetch, callbacks.signal);
   return ssoCredentials(token, refreshCookie);

@@ -25,59 +25,51 @@ import {
   type ProbeResult,
 } from "./capabilities.ts";
 import {
-  loginPortalWithPassword,
   loginPortalWithSso,
-  PORTAL_PASSWORD_PROVIDER,
   PORTAL_SSO_PROVIDER,
   portalAccessToken,
-  refreshPortalPassword,
   refreshPortalSso,
 } from "./portal-auth.ts";
+import { fetchPortalBillingSummary, PortalHttpError } from "./portal-client.ts";
+import { catalogRecordToModelConfig, fetchHepAICatalog, indexCatalog } from "./catalog.ts";
+import { HEPAI_ANTHROPIC_BASE_URL, HEPAI_BASE_URL } from "./endpoints.ts";
+import {
+  HepAIBillingSettler,
+  isHepAIAssistant,
+  responseLink,
+  type HepAIResponseLink,
+} from "./billing-settlement.ts";
 
 const PROVIDER = "hepai";
 const API = "hepai-auto";
-const BASE_URL = "https://aiapi.ihep.ac.cn/apiv2";
-const ANTHROPIC_BASE_URL = `${BASE_URL}/anthropic`;
-// ProviderModelConfig requires concrete numbers even when discovery omits them.
-// These are OMP execution fallbacks, not claims about HepAI catalog metadata.
-const REQUIRED_CONTEXT_FALLBACK = 128_000;
-const REQUIRED_OUTPUT_FALLBACK = 16_384;
 const protocolCache = new Map<string, HepAITransport>();
+const completedResponseLinks = new Map<string, HepAIResponseLink>();
 
 interface HepAIModelRecord { id?: unknown; }
 interface ModelList { data?: unknown; }
 
-function modelConfig(id: string): ProviderModelConfig {
-  return {
-    id,
-    name: id,
-    api: API,
-    reasoning: false,
-    input: ["text"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: REQUIRED_CONTEXT_FALLBACK,
-    maxTokens: REQUIRED_OUTPUT_FALLBACK,
-  };
-}
-
 async function discover(apiKey: string | undefined): Promise<ProviderModelConfig[]> {
   if (!apiKey) return [];
-  const response = await fetch(`${BASE_URL}/models`, {
-    headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
-    signal: AbortSignal.timeout(15_000),
-    redirect: "error",
-  });
+  const [response, catalogResult] = await Promise.all([
+    fetch(`${HEPAI_BASE_URL}/models`, {
+      headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
+      signal: AbortSignal.timeout(15_000),
+      redirect: "error",
+    }),
+    fetchHepAICatalog().catch(() => []),
+  ]);
   if (!response.ok) throw new Error(`HepAI model discovery failed with HTTP ${response.status}`);
   const json = await response.json() as ModelList;
   if (!Array.isArray(json.data)) throw new Error("HepAI /models returned no data array");
   const ids = json.data
     .map(item => (item && typeof item === "object" ? (item as HepAIModelRecord).id : undefined))
     .filter((id): id is string => typeof id === "string" && id.length > 0);
-  return [...new Set(ids)].map(modelConfig);
+  const catalog = indexCatalog(catalogResult);
+  return [...new Set(ids)].map(id => catalogRecordToModelConfig(id, catalog.get(id)));
 }
 
 function cloneModel(model: Model<Api>, api: "openai-responses" | "openai-completions" | "anthropic-messages"): Model<Api> {
-  const baseUrl = api === "anthropic-messages" ? ANTHROPIC_BASE_URL : BASE_URL;
+  const baseUrl = api === "anthropic-messages" ? HEPAI_ANTHROPIC_BASE_URL : HEPAI_BASE_URL;
   const candidate = { ...model, api, baseUrl, compat: undefined } as Model<Api>;
   const policy = resolveModelPolicy(candidate);
   return { ...candidate, compat: policy.compat, identity: policy.identity, thinking: policy.thinking } as Model<Api>;
@@ -116,7 +108,14 @@ function autoStream(model: Model<Api>, context: Context, options?: SimpleStreamO
     const resolvedOptions = { ...options, apiKey };
     const attempts = orderedTransports(model.id, protocolCache.get(model.id));
     for (const protocol of attempts) {
-      const inner = dispatch(protocol, model, context, resolvedOptions);
+      let attemptLink: HepAIResponseLink | undefined;
+      const inner = dispatch(protocol, model, context, {
+        ...resolvedOptions,
+        onResponse: async (response, responseModel) => {
+          await resolvedOptions.onResponse?.(response, responseModel);
+          attemptLink = responseLink(response);
+        },
+      });
       const held: AssistantMessageEvent[] = [];
       let tryNext = false;
       try {
@@ -136,6 +135,9 @@ function autoStream(model: Model<Api>, context: Context, options?: SimpleStreamO
         const terminal = held.at(-1);
         if (terminal?.type === "done") {
           protocolCache.set(model.id, protocol);
+          if (attemptLink && terminal.message.responseId) {
+            completedResponseLinks.set(terminal.message.responseId, attemptLink);
+          }
           for (const event of held) outer.push(event);
           return;
         }
@@ -161,7 +163,7 @@ function autoStream(model: Model<Api>, context: Context, options?: SimpleStreamO
 async function probe(endpoint: ProbeEndpoint, model: string, apiKey: string): Promise<ProbeResult> {
   const body = buildProbeBody(endpoint, model);
   try {
-    const response = await fetch(`${BASE_URL}/${endpoint}`, {
+    const response = await fetch(`${HEPAI_BASE_URL}/${endpoint}`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -182,8 +184,39 @@ async function probe(endpoint: ProbeEndpoint, model: string, apiKey: string): Pr
 }
 
 export default function hepAIProvider(omp: ExtensionAPI): void {
+  let activeSettler: HepAIBillingSettler | undefined;
+
+  const activateSettlement = (ctx: Parameters<Parameters<ExtensionAPI["on"]>[1]>[1]) => {
+    activeSettler = new HepAIBillingSettler({
+      sessionManager: ctx.sessionManager,
+      getPortalToken: forceRefresh => ctx.modelRegistry.getApiKeyForProvider(
+        PORTAL_SSO_PROVIDER,
+        ctx.sessionManager.getSessionId(),
+        { forceRefresh },
+      ),
+      schedule: (callback, delayMs) => ctx.setTimeout(callback, delayMs),
+    });
+    void activeSettler.resume();
+  };
+
+  omp.on("session_start", (_event, ctx) => activateSettlement(ctx));
+  omp.on("session_switch", (_event, ctx) => activateSettlement(ctx));
+  omp.on("message_end", async (event, ctx) => {
+    if (!isHepAIAssistant(event.message) || !event.message.responseId) return;
+    const responseId = event.message.responseId;
+    const link = completedResponseLinks.get(responseId);
+    if (!link) return;
+    completedResponseLinks.delete(responseId);
+    const settler = activeSettler;
+    const sessionFile = ctx.sessionManager.getSessionFile();
+    // OMP reserved the JSONL append before extension notification and does not
+    // wait on this hook for message persistence. Persist the association now so
+    // a process exit cannot lose it; register only queues the billing worker.
+    await settler?.register(responseId, link, sessionFile);
+  });
+
   omp.registerProvider(PROVIDER, {
-    baseUrl: BASE_URL,
+    baseUrl: HEPAI_BASE_URL,
     api: API,
     streamSimple: autoStream,
     authHeader: true,
@@ -193,17 +226,9 @@ export default function hepAIProvider(omp: ExtensionAPI): void {
 
   // Portal authentication is intentionally separate from the model API-key provider.
   // Both flows use OMP's native /login UI and AuthStorage persistence.
-  omp.registerProvider(PORTAL_PASSWORD_PROVIDER, {
-    oauth: {
-      name: "HepAI Portal (username/password)",
-      login: loginPortalWithPassword,
-      refreshToken: refreshPortalPassword,
-      getApiKey: portalAccessToken,
-    },
-  });
   omp.registerProvider(PORTAL_SSO_PROVIDER, {
     oauth: {
-      name: "HepAI Portal (IHEP SSO — no saved password)",
+      name: "HepAI Portal (IHEP SSO — refresh cookie only)",
       login: loginPortalWithSso,
       refreshToken: refreshPortalSso,
       getApiKey: portalAccessToken,
@@ -247,14 +272,72 @@ export default function hepAIProvider(omp: ExtensionAPI): void {
   });
 
   omp.registerCommand("hepai-portal-auth", {
-    description: "Show HepAI Portal password and SSO login entry points",
+    description: "Show HepAI Portal SSO login status",
     handler: async (_args, ctx) => {
-      const password = ctx.modelRegistry.authStorage.hasAuth(PORTAL_PASSWORD_PROVIDER) ? "saved" : "not configured";
       const sso = ctx.modelRegistry.authStorage.hasAuth(PORTAL_SSO_PROVIDER) ? "saved" : "not configured";
       ctx.ui.notify(
-        `Portal auth — password: ${password}; SSO: ${sso}. Use /login ${PORTAL_PASSWORD_PROVIDER} or /login ${PORTAL_SSO_PROVIDER}.`,
+        `Portal SSO: ${sso}. Use /login ${PORTAL_SSO_PROVIDER}.`,
         "info",
       );
+    },
+  });
+
+  omp.registerCommand("hepai-settle", {
+    description: "Retry pending HepAI billing settlement for this session",
+    handler: async (_args, ctx) => {
+      activateSettlement(ctx);
+      ctx.ui.notify("Queued pending HepAI billing records for exact-ID settlement", "info");
+    },
+  });
+
+  omp.registerCommand("hepai-billing", {
+    description: "Show HepAI Portal fund and recent invocation totals",
+    handler: async (args, ctx) => {
+      if (args.trim()) {
+        ctx.ui.notify("Usage: /hepai-billing", "warning");
+        return;
+      }
+      if (!ctx.modelRegistry.authStorage.hasAuth(PORTAL_SSO_PROVIDER)) {
+        ctx.ui.notify(
+          `No HepAI Portal SSO login. Use /login ${PORTAL_SSO_PROVIDER}.`,
+          "error",
+        );
+        return;
+      }
+      const sessionId = ctx.sessionManager.getSessionId();
+      let lastError: unknown;
+      let forceRefresh = false;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const token = await ctx.modelRegistry.getApiKeyForProvider(PORTAL_SSO_PROVIDER, sessionId, { forceRefresh });
+          if (!token) {
+            lastError = new Error("HepAI Portal SSO credential is unavailable");
+            break;
+          }
+          const summary = await fetchPortalBillingSummary(token);
+          ctx.ui.notify(
+            `HepAI billing ${summary.period.start}–${summary.period.end} — `
+            + `funds: ${summary.funds.count}; credit_paid USD: ${summary.funds.creditPaid}; `
+            + `credit_contributed USD: ${summary.funds.creditContributed}; credit_used USD: ${summary.funds.creditUsed}; `
+            + `recent page calls: ${summary.invocations.count}; prompt tokens: ${summary.invocations.promptTokens}; `
+            + `completion tokens: ${summary.invocations.completionTokens}; payable_amount USD: ${summary.invocations.cost}`,
+            "info",
+          );
+          return;
+        } catch (error) {
+          lastError = error;
+          if (error instanceof PortalHttpError && (error.status === 401 || error.status === 403) && !forceRefresh) {
+            forceRefresh = true;
+            continue;
+          }
+          if (!(error instanceof PortalHttpError && (error.status === 401 || error.status === 403))) {
+            ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+            return;
+          }
+          break;
+        }
+      }
+      ctx.ui.notify(lastError instanceof Error ? lastError.message : String(lastError), "error");
     },
   });
 }

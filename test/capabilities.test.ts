@@ -13,6 +13,7 @@ describe("HepAI capability classification", () => {
     expect(classifyProbe("responses", 404, "missing").kind).toBe("endpoint-missing");
     expect(classifyProbe("responses", 404, "model is not available").kind).toBe("model-unsupported");
     expect(classifyProbe("responses", 400, "model is not supported").kind).toBe("model-unsupported");
+    expect(classifyProbe("responses", 400, { detail: { message: "模型 claude-sonnet-4-6 不支持 responses 协议" } }).kind).toBe("model-unsupported");
     expect(classifyProbe("responses", 502, "upstream").kind).toBe("upstream-error");
   });
 

@@ -15,8 +15,6 @@ async function runOMP(args: string[], configRoot: string, agentDir: string) {
   Object.assign(childEnv, {
     PI_CONFIG_DIR: relative(homedir(), configRoot),
     PI_CODING_AGENT_DIR: agentDir,
-    NO_PROXY: "aiapi.ihep.ac.cn",
-    no_proxy: "aiapi.ihep.ac.cn",
   });
   const child = Bun.spawn([ompExe, ...args], {
     cwd: join(import.meta.dir, ".."),
@@ -47,18 +45,51 @@ liveDescribe("HepAI isolated native-AuthStorage integration", () => {
         "models", "hepai", "--json", "--no-extensions", "-e", pluginEntry,
       ], configRoot, agentDir);
       expect({ exitCode: listing.exitCode, stderr: listing.stderr }).toEqual({ exitCode: 0, stderr: "" });
-      const selectors = (JSON.parse(listing.stdout) as { models: Array<{ selector: string }> }).models.map(model => model.selector);
+      const listedModels = (JSON.parse(listing.stdout) as {
+        models: Array<{
+          selector: string;
+          cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+          contextWindow: number;
+          maxTokens: number;
+        }>;
+      }).models;
+      const selectors = listedModels.map(model => model.selector);
       expect(selectors).toContain("hepai/openai/gpt-5.6-sol");
       expect(selectors).toContain("hepai/anthropic/claude-sonnet-4-6");
+      expect(listedModels.find(model => model.selector === "hepai/anthropic/claude-sonnet-4-6")).toMatchObject({
+        cost: { input: 22.68 * 0.143, output: 113.4 * 0.143, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 1_000_000,
+        maxTokens: 128_000,
+      });
 
       const generation = await runOMP([
-        "-p", "--no-tools", "--no-session", "--no-extensions",
+        "-p", "--mode", "json", "--no-tools", "--no-session", "--no-extensions",
         "--model", "hepai/anthropic/claude-sonnet-4-6", "-e", pluginEntry,
         "Reply with exactly OK.",
       ], configRoot, agentDir);
       expect(generation.exitCode).toBe(0);
-      expect(generation.stderr).toContain("Working...");
-      expect(generation.stdout.trim()).toMatch(/^OK\.?$/u);
+      const events = generation.stdout.trim().split(/\r?\n/u).map(line => JSON.parse(line) as {
+        type: string;
+        message?: {
+          role: string;
+          content: Array<{ type: string; text?: string }>;
+          usage: {
+            input: number;
+            output: number;
+            cacheWrite: number;
+            cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+          };
+        };
+      });
+      const completed = events.find(event => event.type === "message_end" && event.message?.role === "assistant")?.message;
+      expect(completed?.content.find(block => block.type === "text")?.text).toMatch(/^OK\.?$/u);
+      expect(completed?.usage.cost.input).toBeCloseTo((completed!.usage.input * 22.68 * 0.143) / 1_000_000, 12);
+      expect(completed?.usage.cost.output).toBeCloseTo((completed!.usage.output * 113.4 * 0.143) / 1_000_000, 12);
+      expect(completed?.usage.cost.cacheWrite).toBe(0);
+      expect(completed?.usage.cost.total).toBeCloseTo(
+        completed!.usage.cost.input + completed!.usage.cost.output,
+        12,
+      );
     } finally {
       await rm(configRoot, { recursive: true, force: true });
     }
