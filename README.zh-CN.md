@@ -1,5 +1,7 @@
 # OMP HepAI Provider
 
+这是面向 OMP 的独立 Provider 实现，并非从其他 HepAI 插件 fork。包版本：`0.3.0`。
+
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 这是 HepAI/HaiDDF 的非官方 Oh My Pi 附属 provider。它将 HepAI 作为 provider `hepai` 接入 OMP，动态发现当前 API Key 可用的模型，原样保留模型 ID，并通过 OMP 原生 Responses、Chat Completions 或 Anthropic Messages transport 发起请求。

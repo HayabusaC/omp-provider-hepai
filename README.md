@@ -1,5 +1,7 @@
 # OMP HepAI Provider
 
+This is an independent OMP provider implementation, not a fork of another HepAI plugin. Package version: `0.3.0`.
+
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 An unofficial Oh My Pi companion provider for HepAI/HaiDDF. It adds provider `hepai`, discovers the models available to the current API key, preserves their original IDs, and sends requests through OMP's native Responses, Chat Completions, or Anthropic Messages transport.
