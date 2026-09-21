@@ -4,11 +4,11 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent";
 import { settledUsageCost } from "../billing-types.ts";
-import { HepAIBillingSettler, responseLink, rewriteAssistantCost } from "../billing-settlement.ts";
+import { HepAIBillingSettler, responseLink, rewriteAssistantCost, rewriteAssistantUsage } from "../billing-settlement.ts";
 import { billingSidecarPath, readBillingSidecar } from "../billing-sidecar.ts";
 
 describe("HepAI authoritative billing settlement", () => {
-  test("uses payable_amount for total and keeps internal reasoning out of output", () => {
+  test("uses payable_amount for total and folds internal reasoning into output", () => {
     const record = {
       invoke_id: 13818596,
       total_discount_rate: 0.3,
@@ -24,10 +24,18 @@ describe("HepAI authoritative billing settlement", () => {
     };
     const result = settledUsageCost(record);
 
+    expect(result.usage).toEqual({
+      input: 34,
+      output: 64,
+      cacheRead: 0,
+      cacheWrite: 0,
+      reasoningTokens: 32,
+      totalTokens: 98,
+    });
     expect(result.cost.total).toBeCloseTo(0.000174 * 0.143, 14);
     expect(result.cost.input).toBeCloseTo(0.000068 * 0.3 * 0.143, 14);
-    expect(result.cost.output).toBeCloseTo(0.000256 * 0.3 * 0.143, 14);
-    expect(result.cost.input + result.cost.output).toBeLessThan(result.cost.total);
+    expect(result.cost.output).toBeCloseTo((0.000256 + 0.000256) * 0.3 * 0.143, 14);
+    expect(result.cost.input + result.cost.output).toBeCloseTo(result.cost.total, 14);
     expect(result.billing).toMatchObject({ currency: "USD", sourceCurrency: "CNY", exchangeRate: 0.143 });
     expect(result.billing.original_price).toBeCloseTo(0.00058 * 0.143, 14);
     expect(result.billing.discount_amount).toBeCloseTo(0.000406 * 0.143, 14);
@@ -37,6 +45,32 @@ describe("HepAI authoritative billing settlement", () => {
       .toBeCloseTo(0.000256 * 0.143, 14);
     expect((result.billing.cost_breakdown.prompt as { cost: number }).cost)
       .toBeCloseTo(0.000068 * 0.143, 14);
+  });
+
+  test("treats missing usage and billing components as zero", () => {
+    const result = settledUsageCost({
+      total_discount_rate: 1,
+      cost_breakdown: { internal_reasoning: { amount: 9, cost: 2 } },
+      original_price: 2,
+      discount_amount: 0,
+      payable_amount: 2,
+    });
+
+    expect(result.usage).toEqual({
+      input: 0,
+      output: 9,
+      cacheRead: 0,
+      cacheWrite: 0,
+      reasoningTokens: 9,
+      totalTokens: 9,
+    });
+    expect(result.cost).toEqual({
+      input: 0,
+      output: 2 * 0.143,
+      cacheRead: 0,
+      cacheWrite: 0,
+      total: 2 * 0.143,
+    });
   });
 
   test("captures only successful response request and trace ids", () => {
@@ -75,7 +109,7 @@ describe("HepAI authoritative billing settlement", () => {
     expect(rewrites).toBe(1);
   });
 
-  test("uses the OMP 18.2.7 atomic session rewrite and updates its live message reference", async () => {
+  test("atomically rewrites settled tokens and cost in the live message and JSONL", async () => {
     const dir = await mkdtemp(join(tmpdir(), "hepai-session-"));
     const manager = SessionManager.create(dir, dir);
     try {
@@ -95,13 +129,16 @@ describe("HepAI authoritative billing settlement", () => {
       };
       manager.appendMessage(message);
       await manager.rewriteEntries();
+      const usage = {
+        input: 12, output: 13, cacheRead: 0, cacheWrite: 3, totalTokens: 28, reasoningTokens: 5,
+      };
       const cost = { input: 0.01, output: 0.02, cacheRead: 0.03, cacheWrite: 0.04, total: 0.12 };
-      await rewriteAssistantCost(manager, "resp-live", cost);
+      await rewriteAssistantUsage(manager, "resp-live", usage, cost);
 
-      expect(message.usage.cost).toEqual(cost);
+      expect(message.usage).toEqual({ ...usage, cost });
       const lines = (await readFile(manager.getSessionFile()!, "utf8")).trim().split("\n");
       const persisted = lines.map(line => JSON.parse(line)).find(entry => entry.type === "message");
-      expect(persisted.message.usage.cost).toEqual(cost);
+      expect(persisted.message.usage).toEqual({ ...usage, cost });
       expect(persisted.message.usage.reasoningTokens).toBe(5);
     } finally {
       await manager.close();
@@ -135,7 +172,11 @@ describe("HepAI authoritative billing settlement", () => {
           return {
             invoke_id: 42,
             total_discount_rate: 0.5,
-            cost_breakdown: { prompt: { cost: 1 }, completion: { cost: 1 }, internal_reasoning: { cost: 1 } },
+            cost_breakdown: {
+              prompt: { amount: 10, cost: 1 },
+              completion: { amount: 6, cost: 1 },
+              internal_reasoning: { amount: 4, cost: 1 },
+            },
             original_price: 3,
             discount_amount: 1.5,
             payable_amount: 1.5,
@@ -157,8 +198,13 @@ describe("HepAI authoritative billing settlement", () => {
       expect((stored.records["req-worker"]?.billing?.cost_breakdown.internal_reasoning as { cost: number }).cost)
         .toBeCloseTo(1 * 0.143, 12);
       const settledEntry = manager.getEntries()[0];
-      expect(settledEntry?.type === "message" && settledEntry.message.role === "assistant"
-        ? settledEntry.message.usage.cost.total : -1).toBeCloseTo(1.5 * 0.143, 12);
+      if (settledEntry?.type !== "message" || settledEntry.message.role !== "assistant") {
+        throw new Error("expected settled assistant entry");
+      }
+      expect(settledEntry.message.usage).toMatchObject({
+        input: 10, output: 10, cacheRead: 0, cacheWrite: 0, reasoningTokens: 4, totalTokens: 20,
+      });
+      expect(settledEntry.message.usage.cost.total).toBeCloseTo(1.5 * 0.143, 12);
       expect(lookups).toBe(1);
       expect(syncs).toBe(1);
 

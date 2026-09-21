@@ -1,6 +1,6 @@
 # OMP HepAI Provider
 
-这是面向 OMP 的独立 Provider 实现，并非从其他 HepAI 插件 fork。包版本：`0.3.0`。
+这是面向 OMP 的独立 Provider 实现，并非从其他 HepAI 插件 fork。包版本：`0.3.1`。
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -136,6 +136,8 @@ Portal 访问是可选功能；列出和调用模型都不需要 Portal 登录�
 
 `/login hepai-portal-sso` 要求 OMP browser-session 登录只捕获 HepAI 的 `refresh-token` cookie。插件用该 cookie 换取 Portal access JWT，并通过 OMP 原生 OAuth 凭据保存两者。插件不会请求或保存用户的 IHEP 用户名和密码。
 
+每个 OMP 进程只在第一次 `session_start` 时静默预检一次 Portal JWT，且只请求经费汇总接口。遇到 `401` 或 `403` 时，先使用已保存的 `refresh-token` 静默刷新一次；若尚无 Portal 凭据、刷新失败，或刷新后的 JWT 仍被拒绝，交互式 TUI 会自动打开同一套原生 browser-session SSO 流程。网络错误及非鉴权类服务端错误只写日志，不会打开 SSO；无界面模式绝不自动打开浏览器，需要之后在交互模式手动执行 `/login hepai-portal-sso`。
+
 `/hepai-billing` 并行读取：
 
 - `GET /apiv2/portal/billing/mine/all_funds`
@@ -159,11 +161,11 @@ Portal 访问是可选功能；列出和调用模型都不需要 Portal 登录�
 
 ### Session 真实费用结算
 
-HepAI assistant 调用成功后，`input`、`output`、`cacheRead`、`cacheWrite`、`reasoningTokens` 和 `totalTokens` 仍完全由 OMP 原生协议解析器提供。插件不修改 OMP `Usage` 结构或 token 解析逻辑。
+HepAI assistant 调用成功后，结算 token 数以权威 `cost_breakdown` 为准。`input`、`output`、`cacheRead`、`cacheWrite` 和 `internal_reasoning` 五个组成项均可独立缺失；缺失项的 token 和费用均按 0 处理。插件保持 OMP 原生 `Usage` 结构不变。
 
 AssistantMessage 正常落盘后，插件为每个 session 写入 `<session>.hepai-billing.json` sidecar，保存精确的 `responseId ↔ requestId ↔ traceId ↔ invokeId` 关联，并在后台有限重试 `POST /apiv2/portal/billing/invoke_records`。只有 `remarks.request_id` 与捕获的 request ID 完全相同，且已捕获 trace ID 时 `remarks.trace_id` 也完全相同，记录才会被接受。插件绝不会使用最新/时间最近的记录，也不会通过余额变化猜测关联。
 
-查到账单后，`payable_amount` 是总费用的唯一权威值。HepAI 返回的每个金额都按 CNY 处理，并在保存前统一执行 `CNY × 0.143`：包括 `original_price`、`discount_amount`、`payable_amount` 以及每个 `cost_breakdown.*.cost`。token 数量 `amount` 等非金额字段和无量纲的 `total_discount_rate` 不换算。sidecar 将换算后的值标记为 `currency: "USD"`，同时记录 `sourceCurrency: "CNY"`、`exchangeRate: 0.143` 和完整的已换算 breakdown。可映射且已折扣的 breakdown 费用写入 `usage.cost.input`、`output`、`cacheRead` 和 `cacheWrite`；`internal_reasoning` 作为独立 sidecar 项保留，不合并进 output。包括无法映射项目在内的全部收费仍通过换算后的 `payable_amount` 计入 `usage.cost.total`；无关的敏感调用字段不会被复制。
+查到账单后，`payable_amount` 是总费用的唯一权威值。HepAI 返回的每个金额都按 CNY 处理，并在保存前统一执行 `CNY × 0.143`：包括 `original_price`、`discount_amount`、`payable_amount` 以及每个 `cost_breakdown.*.cost`。token 数量 `amount` 等非金额字段和无量纲的 `total_discount_rate` 不换算。sidecar 将换算后的值标记为 `currency: "USD"`，同时记录 `sourceCurrency: "CNY"`、`exchangeRate: 0.143` 和完整的已换算 breakdown，其中仍单独保留 `internal_reasoning` 项。在 OMP session JSONL 中，`usage.output` 为 HepAI 的 output/completion token 加 `internal_reasoning` token，`usage.cost.output` 为两者折后费用之和。`reasoningTokens` 继续标记其中的 reasoning 子集，便于统计；`totalTokens` 只计算一次已合并的 output，不重复加 reasoning。其他可映射 breakdown 值写入 input 和 cache 字段。包括无法映射项目在内的全部收费仍通过换算后的 `payable_amount` 计入 `usage.cost.total`；无关的敏感调用字段不会被复制。
 
 插件通过 `responseId` 精确定位 assistant entry，并使用 OMP 18.2.7 原生原子 `SessionManager.rewriteEntries()` 重写。共享的 session/runtime 消息引用同步更新，之后由 `@oh-my-pi/omp-stats` 重新 ingest。已 settled 的 request ID 幂等，不会重复修改；pending 状态跨重启保留。未配置 Portal SSO 时不会影响推理，只保持 pending；一轮有限重试耗尽后标为 `failed`，重启或 `/hepai-settle` 会在登录后重新激活 pending/failed 项。
 

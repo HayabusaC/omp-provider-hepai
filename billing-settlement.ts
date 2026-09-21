@@ -47,6 +47,32 @@ function matchingAssistantEntry(entries: SessionEntry[], responseId: string) {
     && entry.message.responseId === responseId);
 }
 
+export async function rewriteAssistantUsage(
+  manager: ReadonlySessionManager,
+  responseId: string,
+  usage: Pick<Usage, "input" | "output" | "cacheRead" | "cacheWrite" | "totalTokens" | "reasoningTokens">,
+  cost: Usage["cost"],
+): Promise<{ entryId: string; changed: boolean }> {
+  const entry = matchingAssistantEntry(manager.getEntries(), responseId);
+  if (!entry || entry.type !== "message" || entry.message.role !== "assistant") {
+    throw new Error(`No persisted AssistantMessage matches responseId ${responseId}`);
+  }
+  const currentUsage = entry.message.usage;
+  const current = currentUsage.cost;
+  const changed = currentUsage.input !== usage.input || currentUsage.output !== usage.output
+    || currentUsage.cacheRead !== usage.cacheRead || currentUsage.cacheWrite !== usage.cacheWrite
+    || currentUsage.totalTokens !== usage.totalTokens || currentUsage.reasoningTokens !== usage.reasoningTokens
+    || current.input !== cost.input || current.output !== cost.output || current.cacheRead !== cost.cacheRead
+    || current.cacheWrite !== cost.cacheWrite || current.total !== cost.total;
+  if (changed) {
+    Object.assign(entry.message.usage, usage);
+    entry.message.usage.cost = { ...cost };
+    await writableManager(manager).rewriteEntries();
+  }
+  return { entryId: entry.id, changed };
+}
+
+/** Backward-compatible helper for callers that only need to replace cost. */
 export async function rewriteAssistantCost(
   manager: ReadonlySessionManager,
   responseId: string,
@@ -56,15 +82,8 @@ export async function rewriteAssistantCost(
   if (!entry || entry.type !== "message" || entry.message.role !== "assistant") {
     throw new Error(`No persisted AssistantMessage matches responseId ${responseId}`);
   }
-  const current = entry.message.usage.cost;
-  const changed = current.input !== cost.input || current.output !== cost.output
-    || current.cacheRead !== cost.cacheRead || current.cacheWrite !== cost.cacheWrite
-    || current.total !== cost.total;
-  if (changed) {
-    entry.message.usage.cost = { ...cost };
-    await writableManager(manager).rewriteEntries();
-  }
-  return { entryId: entry.id, changed };
+  const usage = entry.message.usage;
+  return rewriteAssistantUsage(manager, responseId, usage, cost);
 }
 
 function retryAt(attempts: number, now: Date): string {
@@ -164,9 +183,9 @@ export class HepAIBillingSettler {
         });
       }
       if (!invoice) throw new Error("matching HepAI billing record is not available yet");
-      const { cost, billing } = settledUsageCost(invoice);
+      const { usage, cost, billing } = settledUsageCost(invoice);
       if (this.context.sessionManager.getSessionFile() !== record.sessionFile) return;
-      const rewrite = await rewriteAssistantCost(this.context.sessionManager, record.responseId, cost);
+      const rewrite = await rewriteAssistantUsage(this.context.sessionManager, record.responseId, usage, cost);
       await (this.context.syncStats ?? (() => syncAllSessions({ workers: 1 })))();
       await updateBillingRecord(record.sessionFile, record.requestId, current => ({
         ...current,

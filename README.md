@@ -1,6 +1,6 @@
 # OMP HepAI Provider
 
-This is an independent OMP provider implementation, not a fork of another HepAI plugin. Package version: `0.3.0`.
+This is an independent OMP provider implementation, not a fork of another HepAI plugin. Package version: `0.3.1`.
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
@@ -136,6 +136,8 @@ Portal access is optional and is not needed to list or invoke models.
 
 `/login hepai-portal-sso` asks OMP's browser-session login to capture only the HepAI `refresh-token` cookie. The plugin exchanges that cookie for a Portal access JWT and stores both through native OMP OAuth credentials. It never asks for or stores the user's IHEP username or password.
 
+Once per OMP process, the first `session_start` performs a silent Portal JWT preflight using only the fund-summary endpoint. A `401` or `403` first triggers one silent refresh with the stored `refresh-token`. If no Portal credential exists, the refresh fails, or the refreshed JWT is still rejected, interactive TUI mode opens the same native browser-session SSO flow automatically. Network and non-authentication server failures are logged without opening SSO. Headless modes never open a browser and instead require a later interactive `/login hepai-portal-sso`.
+
 `/hepai-billing` concurrently reads:
 
 - `GET /apiv2/portal/billing/mine/all_funds`
@@ -159,11 +161,11 @@ Billing insertion may be asynchronous, so a new invocation can take a short time
 
 ### Authoritative session cost settlement
 
-For successful HepAI assistant turns, OMP's native protocol parsers remain the sole source of `input`, `output`, `cacheRead`, `cacheWrite`, `reasoningTokens`, and `totalTokens`. The plugin does not change the OMP `Usage` shape or token parsing.
+For successful HepAI assistant turns, the settled token counts come from the authoritative `cost_breakdown`. The five components `input`, `output`, `cacheRead`, `cacheWrite`, and `internal_reasoning` are independently optional; a missing component contributes zero tokens and zero cost. The plugin preserves OMP's native `Usage` shape.
 
 After the assistant message has been allowed to persist normally, the plugin writes a per-session `<session>.hepai-billing.json` sidecar containing the exact `responseId ↔ requestId ↔ traceId ↔ invokeId` association. It polls `POST /apiv2/portal/billing/invoke_records` in the background with bounded retries. A record is accepted only when `remarks.request_id` exactly equals the captured request ID and, when a trace ID was captured, `remarks.trace_id` also exactly matches. It never selects the newest/nearest record or infers a match from a balance change.
 
-Once found, `payable_amount` is the authoritative total. Every monetary value from HepAI is treated as CNY and converted with `CNY × 0.143` before storage: this includes `original_price`, `discount_amount`, `payable_amount`, and every `cost_breakdown.*.cost`. Non-monetary quantities such as token `amount` and the dimensionless `total_discount_rate` are not converted. The sidecar marks the converted values as `currency: "USD"`, records `sourceCurrency: "CNY"` and `exchangeRate: 0.143`, and retains the complete converted breakdown. Mappable discounted breakdown costs populate `usage.cost.input`, `output`, `cacheRead`, and `cacheWrite`; `internal_reasoning` remains a separate sidecar item and is not folded into output. All billed items, including unmapped ones, remain included in `usage.cost.total` through the converted `payable_amount`. Unrelated sensitive invocation fields are not copied.
+Once found, `payable_amount` is the authoritative total. Every monetary value from HepAI is treated as CNY and converted with `CNY × 0.143` before storage: this includes `original_price`, `discount_amount`, `payable_amount`, and every `cost_breakdown.*.cost`. Non-monetary quantities such as token `amount` and the dimensionless `total_discount_rate` are not converted. The sidecar marks the converted values as `currency: "USD"`, records `sourceCurrency: "CNY"` and `exchangeRate: 0.143`, and retains the complete converted breakdown, including its separate `internal_reasoning` component. In the OMP session JSONL, `usage.output` is HepAI output/completion tokens plus `internal_reasoning` tokens, and `usage.cost.output` is their combined discounted cost. `reasoningTokens` preserves the reasoning subset for reporting; `totalTokens` counts the combined output only once. Other mappable breakdown values populate the input and cache fields. All billed items, including unmapped ones, remain included in `usage.cost.total` through the converted `payable_amount`. Unrelated sensitive invocation fields are not copied.
 
 The exact assistant entry is found by `responseId` and rewritten through OMP 18.2.7's native atomic `SessionManager.rewriteEntries()` implementation. The live message object is updated through the shared session/runtime reference, then `@oh-my-pi/omp-stats` re-ingests sessions. Settled request IDs are idempotent. Pending entries survive restart; missing Portal SSO leaves them pending without affecting inference. A finite retry run ends in `failed`, and restart or `/hepai-settle` reactivates pending/failed entries after login.
 

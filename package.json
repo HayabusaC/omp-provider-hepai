@@ -1,6 +1,6 @@
 {
   "name": "omp-provider-hepai",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "HepAI provider with live model discovery and protocol diagnostics for OMP.",
   "type": "module",
   "license": "MIT",

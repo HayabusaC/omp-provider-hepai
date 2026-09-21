@@ -1,7 +1,29 @@
 import { describe, expect, test } from "bun:test";
-import { fetchPortalBillingSummary, findPortalInvocation, portalDateTime } from "../portal-client.ts";
+import {
+  fetchPortalBillingSummary,
+  findPortalInvocation,
+  PortalHttpError,
+  portalDateTime,
+  verifyPortalAccessToken,
+} from "../portal-client.ts";
 
 describe("HepAI Portal billing", () => {
+  test("silently validates a Portal JWT with only the fund endpoint", async () => {
+    const requests: string[] = [];
+    await verifyPortalAccessToken("jwt", {
+      fetch: async (input, init) => {
+        requests.push(String(input));
+        expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer jwt");
+        return Response.json({ items: [] });
+      },
+    });
+    expect(requests).toEqual(["https://aiapi.ihep.ac.cn/apiv2/portal/billing/mine/all_funds"]);
+
+    await expect(verifyPortalAccessToken("bad", {
+      fetch: async () => new Response(null, { status: 401 }),
+    })).rejects.toEqual(expect.objectContaining({ status: 401 }));
+  });
+
   test("uses production-compatible timestamps and summarizes verified fields", async () => {
     const requests: Array<{ url: string; init?: RequestInit }> = [];
     const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {

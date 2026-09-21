@@ -14,6 +14,7 @@ import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-comple
 import { streamOpenAIResponses } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
 import { resolveModelPolicy } from "@oh-my-pi/pi-catalog/compat/resolve";
+import { captureBrowserSession } from "@oh-my-pi/pi-coding-agent/utils/browser-session";
 import {
   buildProbeBody,
   chooseSupportedTransport,
@@ -30,7 +31,7 @@ import {
   portalAccessToken,
   refreshPortalSso,
 } from "./portal-auth.ts";
-import { fetchPortalBillingSummary, PortalHttpError } from "./portal-client.ts";
+import { fetchPortalBillingSummary, PortalHttpError, verifyPortalAccessToken } from "./portal-client.ts";
 import { catalogRecordToModelConfig, fetchHepAICatalog, indexCatalog } from "./catalog.ts";
 import { HEPAI_ANTHROPIC_BASE_URL, HEPAI_BASE_URL } from "./endpoints.ts";
 import {
@@ -185,6 +186,7 @@ async function probe(endpoint: ProbeEndpoint, model: string, apiKey: string): Pr
 
 export default function hepAIProvider(omp: ExtensionAPI): void {
   let activeSettler: HepAIBillingSettler | undefined;
+  let portalPreflight: Promise<void> | undefined;
 
   const activateSettlement = (ctx: Parameters<Parameters<ExtensionAPI["on"]>[1]>[1]) => {
     activeSettler = new HepAIBillingSettler({
@@ -199,7 +201,82 @@ export default function hepAIProvider(omp: ExtensionAPI): void {
     void activeSettler.resume();
   };
 
-  omp.on("session_start", (_event, ctx) => activateSettlement(ctx));
+  const startPortalPreflight = (ctx: Parameters<Parameters<ExtensionAPI["on"]>[1]>[1]) => {
+    if (portalPreflight) return;
+    portalPreflight = (async () => {
+      let loginRequired = !ctx.modelRegistry.authStorage.hasAuth(PORTAL_SSO_PROVIDER);
+      if (!loginRequired) {
+        try {
+          let token = await ctx.modelRegistry.getApiKeyForProvider(
+            PORTAL_SSO_PROVIDER,
+            ctx.sessionManager.getSessionId(),
+          );
+          if (!token) {
+            loginRequired = true;
+          } else {
+            try {
+              await verifyPortalAccessToken(token, { signal: AbortSignal.timeout(15_000) });
+            } catch (error) {
+              if (!(error instanceof PortalHttpError) || (error.status !== 401 && error.status !== 403)) {
+                omp.logger.warn("HepAI Portal preflight could not verify the saved JWT", { error });
+                return;
+              }
+              token = await ctx.modelRegistry.getApiKeyForProvider(
+                PORTAL_SSO_PROVIDER,
+                ctx.sessionManager.getSessionId(),
+                { forceRefresh: true },
+              );
+              if (!token) {
+                loginRequired = true;
+              } else {
+                try {
+                  await verifyPortalAccessToken(token, { signal: AbortSignal.timeout(15_000) });
+                } catch (refreshError) {
+                  if (refreshError instanceof PortalHttpError
+                    && (refreshError.status === 401 || refreshError.status === 403)) {
+                    loginRequired = true;
+                  } else {
+                    omp.logger.warn("HepAI Portal preflight failed after refreshing the JWT", { error: refreshError });
+                    return;
+                  }
+                }
+              }
+            }
+          }
+        } catch (error) {
+          omp.logger.warn("HepAI Portal credential refresh failed; requesting SSO login", { error });
+          loginRequired = true;
+        }
+      }
+      if (!loginRequired) return;
+      if (!ctx.hasUI || ctx.mode !== "tui") {
+        omp.logger.warn(`HepAI Portal SSO login is required; run /login ${PORTAL_SSO_PROVIDER} in interactive mode`);
+        return;
+      }
+
+      const statusKey = "hepai-portal-preflight";
+      ctx.ui.setStatus(statusKey, "HepAI Portal login required…");
+      try {
+        await ctx.modelRegistry.authStorage.login(PORTAL_SSO_PROVIDER, {
+          onAuth: () => {},
+          onPrompt: async prompt => (await ctx.ui.input(prompt.message)) ?? "",
+          onProgress: message => ctx.ui.setStatus(statusKey, message),
+          onBrowserSession: captureBrowserSession,
+        });
+        ctx.ui.notify("HepAI Portal SSO login completed", "info");
+        await activeSettler?.resume();
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      } finally {
+        ctx.ui.setStatus(statusKey, undefined);
+      }
+    })();
+  };
+
+  omp.on("session_start", (_event, ctx) => {
+    activateSettlement(ctx);
+    startPortalPreflight(ctx);
+  });
   omp.on("session_switch", (_event, ctx) => activateSettlement(ctx));
   omp.on("message_end", async (event, ctx) => {
     if (!isHepAIAssistant(event.message) || !event.message.responseId) return;

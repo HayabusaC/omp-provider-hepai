@@ -54,6 +54,18 @@ function componentCost(breakdown: Record<string, HepAICostComponent | unknown>, 
   return total;
 }
 
+function componentAmount(breakdown: Record<string, HepAICostComponent | unknown>, names: string[]): number {
+  let total = 0;
+  for (const name of names) {
+    const item = breakdown[name];
+    if (item && typeof item === "object" && "amount" in item) {
+      const value = (item as HepAICostComponent).amount;
+      if (typeof value === "number" && Number.isFinite(value) && value >= 0) total += value;
+    }
+  }
+  return total;
+}
+
 function convertedBreakdown(
   breakdown: Record<string, HepAICostComponent | unknown>,
 ): Record<string, HepAICostComponent | unknown> {
@@ -69,8 +81,9 @@ function convertedBreakdown(
   }));
 }
 
-/** Apply HepAI's invoice to only the monetary portion of OMP's native Usage. */
+/** Apply HepAI's authoritative token and monetary breakdown to OMP's native Usage. */
 export function settledUsageCost(record: HepAIInvokeRecord): {
+  usage: Pick<Usage, "input" | "output" | "cacheRead" | "cacheWrite" | "totalTokens" | "reasoningTokens">;
   cost: Usage["cost"];
   billing: HepAIBillingMetadata;
 } {
@@ -83,17 +96,31 @@ export function settledUsageCost(record: HepAIInvokeRecord): {
     throw new Error("HepAI billing record has no cost_breakdown object");
   }
 
-  // Observed HepAI records store pre-discount component costs. Scale mapped
-  // components by the authoritative total_discount_rate. Unmapped items
-  // (notably internal_reasoning) remain represented by total only.
+  // Observed HepAI records store pre-discount component costs. Missing token
+  // and cost components are zero. HepAI bills internal reasoning separately,
+  // while OMP's output bucket represents all generated tokens and their cost.
   const billingBreakdown = convertedBreakdown(breakdown);
   const discountedUsd = (cny: number) => cny * discountRate * HEPAI_CNY_TO_USD;
+  const input = componentAmount(breakdown, ["prompt", "input"]);
+  const generatedOutput = componentAmount(breakdown, ["completion", "output"]);
+  const reasoningTokens = componentAmount(breakdown, ["internal_reasoning"]);
+  const output = generatedOutput + reasoningTokens;
+  const cacheRead = componentAmount(breakdown, ["input_cache_read", "cache_read", "cacheRead"]);
+  const cacheWrite = componentAmount(breakdown, ["input_cache_write", "cache_write", "cacheWrite"]);
   return {
+    usage: {
+      input,
+      output,
+      cacheRead,
+      cacheWrite,
+      reasoningTokens,
+      totalTokens: input + output + cacheRead + cacheWrite,
+    },
     cost: {
       input: discountedUsd(componentCost(breakdown, ["prompt", "input"])),
-      output: discountedUsd(componentCost(breakdown, ["completion", "output"])),
-      cacheRead: discountedUsd(componentCost(breakdown, ["input_cache_read", "cache_read"])),
-      cacheWrite: discountedUsd(componentCost(breakdown, ["input_cache_write", "cache_write"])),
+      output: discountedUsd(componentCost(breakdown, ["completion", "output", "internal_reasoning"])),
+      cacheRead: discountedUsd(componentCost(breakdown, ["input_cache_read", "cache_read", "cacheRead"])),
+      cacheWrite: discountedUsd(componentCost(breakdown, ["input_cache_write", "cache_write", "cacheWrite"])),
       total: payable * HEPAI_CNY_TO_USD,
     },
     billing: {

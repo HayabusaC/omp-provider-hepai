@@ -146,6 +146,21 @@ export async function fetchPortalBillingSummary(
   };
 }
 
+/** Validate a Portal access token without loading invocation history. */
+export async function verifyPortalAccessToken(
+  accessToken: string,
+  options: { signal?: AbortSignal; fetch?: Fetcher } = {},
+): Promise<void> {
+  const payload = await portalJson(
+    accessToken,
+    "/portal/billing/mine/all_funds",
+    { method: "GET" },
+    options.fetch ?? fetch,
+    options.signal,
+  );
+  itemsOf(payload, "fund summary");
+}
+
 export interface FindInvocationOptions {
   requestId: string;
   traceId?: string;
