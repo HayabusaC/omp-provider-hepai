@@ -1,15 +1,15 @@
 import type { ProviderModelConfig } from "@oh-my-pi/pi-coding-agent";
 import { HEPAI_CNY_TO_USD } from "./billing-types.ts";
-import { HEPAI_CATALOG_URL } from "./endpoints.ts";
+import { HEPAI_MODEL_DETAILS_URL } from "./endpoints.ts";
 
-const PAGE_SIZE = 100;
-const MAX_PAGES = 50;
+const DETAIL_CONCURRENCY = 8;
 
 export const REQUIRED_CONTEXT_FALLBACK = 128_000;
 export const REQUIRED_OUTPUT_FALLBACK = 16_384;
 
 export interface HepAICatalogRecord {
   id?: unknown;
+  model_name?: unknown;
   display_label?: unknown;
   context_window?: unknown;
   max_output_tokens?: unknown;
@@ -18,12 +18,12 @@ export interface HepAICatalogRecord {
   input_price_per_mtoken?: unknown;
   output_price_per_mtoken?: unknown;
   model_pricing?: unknown;
+  limitations?: unknown;
+  capabilities?: unknown;
 }
 
-interface CatalogPage {
+interface DetailResponse {
   data?: unknown;
-  page?: unknown;
-  total_pages?: unknown;
 }
 
 interface PricingDetails {
@@ -59,12 +59,20 @@ function pricingDetails(record: HepAICatalogRecord): PricingDetails | undefined 
   return details && typeof details === "object" ? details as PricingDetails : undefined;
 }
 
+function nestedRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
 function rate(primary: unknown, fallback: unknown): number {
   return (nonNegativeNumber(primary) ?? nonNegativeNumber(fallback) ?? 0) * HEPAI_CNY_TO_USD;
 }
 
 export function catalogRecordToModelConfig(id: string, record?: HepAICatalogRecord): ProviderModelConfig {
   const details = record ? pricingDetails(record) : undefined;
+  const limitations = nestedRecord(record?.limitations);
+  const capabilities = nestedRecord(record?.capabilities);
   const modalities = Array.isArray(record?.input_modalities) ? record.input_modalities : [];
   const input: ("text" | "image")[] = ["text"];
   if (modalities.includes("image")) input.push("image");
@@ -75,7 +83,7 @@ export function catalogRecordToModelConfig(id: string, record?: HepAICatalogReco
       ? record.display_label.trim()
       : id,
     api: "hepai-auto",
-    reasoning: record?.is_reasoning === true || (
+    reasoning: record?.is_reasoning === true || capabilities?.reasoning === true || (
       !!record?.is_reasoning && typeof record.is_reasoning === "object"
     ),
     input,
@@ -85,8 +93,8 @@ export function catalogRecordToModelConfig(id: string, record?: HepAICatalogReco
       cacheRead: rate(details?.cache_read_input_cost_per_million_tokens, details?.rates?.input_cache_read),
       cacheWrite: rate(details?.cache_creation_cost_per_million_tokens, details?.rates?.input_cache_write),
     },
-    contextWindow: positiveInteger(record?.context_window) ?? REQUIRED_CONTEXT_FALLBACK,
-    maxTokens: positiveInteger(record?.max_output_tokens) ?? REQUIRED_OUTPUT_FALLBACK,
+    contextWindow: positiveInteger(record?.context_window ?? limitations?.context_window) ?? REQUIRED_CONTEXT_FALLBACK,
+    maxTokens: positiveInteger(record?.max_output_tokens ?? limitations?.max_output_tokens) ?? REQUIRED_OUTPUT_FALLBACK,
   };
 }
 
@@ -98,25 +106,51 @@ export function indexCatalog(records: readonly HepAICatalogRecord[]): Map<string
   return indexed;
 }
 
-export async function fetchHepAICatalog(fetcher: typeof fetch = fetch): Promise<HepAICatalogRecord[]> {
+async function fetchModelDetail(
+  modelId: string,
+  accessToken: string,
+  fetcher: typeof fetch,
+): Promise<HepAICatalogRecord | undefined> {
+  const url = new URL(HEPAI_MODEL_DETAILS_URL);
+  url.searchParams.set("model_name", modelId);
+  const response = await fetcher(url, {
+    headers: { Authorization: `Bearer ${accessToken}`, Accept: "application/json" },
+    signal: AbortSignal.timeout(15_000),
+    redirect: "error",
+  });
+  if (!response.ok) throw new Error(`HepAI model detail discovery failed with HTTP ${response.status}`);
+  const payload = await response.json() as DetailResponse;
+  const candidates = Array.isArray(payload.data) ? payload.data : [payload.data];
+  return candidates.find(
+    (item): item is HepAICatalogRecord => !!item && typeof item === "object"
+      && (
+        (item as HepAICatalogRecord).id === modelId
+        || (item as HepAICatalogRecord).model_name === modelId
+        || candidates.length === 1
+      ),
+  );
+}
+
+export async function fetchHepAICatalog(
+  modelIds: readonly string[],
+  accessToken: string,
+  fetcher: typeof fetch = fetch,
+): Promise<HepAICatalogRecord[]> {
   const records: HepAICatalogRecord[] = [];
-  for (let page = 1; page <= MAX_PAGES; page++) {
-    const url = new URL(HEPAI_CATALOG_URL);
-    url.searchParams.set("page", String(page));
-    url.searchParams.set("page_size", String(PAGE_SIZE));
-    const response = await fetcher(url, {
-      headers: { Accept: "application/json" },
-      signal: AbortSignal.timeout(15_000),
-      redirect: "error",
-    });
-    if (!response.ok) throw new Error(`HepAI catalog discovery failed with HTTP ${response.status}`);
-    const payload = await response.json() as CatalogPage;
-    if (!Array.isArray(payload.data)) throw new Error("HepAI catalog returned no data array");
-    records.push(...payload.data.filter(
-      (item): item is HepAICatalogRecord => !!item && typeof item === "object",
-    ));
-    const totalPages = positiveInteger(payload.total_pages);
-    if ((totalPages !== undefined && page >= totalPages) || payload.data.length < PAGE_SIZE) return records;
-  }
-  throw new Error(`HepAI catalog exceeded the ${MAX_PAGES}-page safety limit`);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(DETAIL_CONCURRENCY, modelIds.length) }, async () => {
+    while (cursor < modelIds.length) {
+      const modelId = modelIds[cursor++];
+      if (!modelId) continue;
+      try {
+        const record = await fetchModelDetail(modelId, accessToken, fetcher);
+        if (record) records.push({ ...record, id: modelId });
+      } catch {
+        // Detail enrichment is optional; one unavailable model must not hide the
+        // authoritative API-key-scoped model list or suppress other details.
+      }
+    }
+  });
+  await Promise.all(workers);
+  return records;
 }

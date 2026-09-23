@@ -26,7 +26,7 @@
 | 方法 | 路径 | 鉴权 | 用途 |
 | --- | --- | --- | --- |
 | `GET` | `/apiv2/models` | 模型 API Key | 当前 Key 可访问模型的权威列表 |
-| `GET` | `/apiv2/portal/model/list_cloud_models?page=<n>&page_size=100` | 无 | 可选模型元数据增强 |
+| `GET` | `/apiv2/portal/model/cloud_models_details?model_name=<id>` | SSO Portal JWT | 单个可访问模型的可选元数据 |
 | `POST` | `/apiv2/responses` | 模型 API Key | Responses transport 与探测 |
 | `POST` | `/apiv2/chat/completions` | 模型 API Key | Chat Completions transport 与探测 |
 | `POST` | `/apiv2/anthropic/v1/messages` | 模型 API Key | Anthropic transport 与探测 |
@@ -74,20 +74,20 @@ omp plugin link .\omp-provider-hepai
 | Provider ID | 凭据 | 用途 |
 | --- | --- | --- |
 | `hepai` | HepAI 模型 API Key | 模型发现和推理 |
-| `hepai-portal-sso` | Portal refresh cookie 与 access JWT | 仅用于 Portal 账单 |
+| `hepai-portal-sso` | Portal refresh cookie 与 access JWT | 模型详情元数据及 Portal 账单 |
 
-两类凭据不会混用：Portal JWT 不会发送到推理接口，模型 API Key 也不会发送到 Portal 账单接口。
+两类凭据不会混用：Portal JWT 只发送到 Portal endpoint（包括模型详情和账单），模型 API Key 只发送到模型列表和推理 endpoint。
 
 ### 2. 模型发现
 
 OMP 解析 `hepai` 凭据后调用 provider 的动态模型加载器。
 
 1. `GET /apiv2/models` 返回当前 API Key 可访问的权威模型 ID。
-2. 插件读取公共 Portal catalog，每页 100 条，最多 50 页。
-3. catalog 按模型 ID 精确匹配，可补充显示名称、上下文/输出上限、推理能力、图片输入能力及已验证的每百万 token 价格；catalog 中的金额单价按 `× 0.143` 从 CNY 换算到 OMP 的 USD 字段。
-4. 最终只暴露 `/models` 返回的 ID；公共 catalog 绝不会添加当前 Key 无权访问的模型。
+2. 有 SSO Portal JWT 时，插件会对每个可访问模型 ID 请求 `/portal/model/cloud_models_details?model_name=<id>`，并限制并发数。
+3. 详情记录按模型 ID 精确匹配，可补充显示名称、上下文/输出上限、推理能力、图片输入能力及已验证的每百万 token 价格；详情中的金额单价按 `× 0.143` 从 CNY 换算到 OMP 的 USD 字段。
+4. 最终只暴露 `/models` 返回的 ID；详情记录绝不会添加当前 Key 无权访问的模型。
 
-如果 catalog 加载失败，模型发现仍会返回 API Key 范围内的模型。OMP 必填数值字段使用明确的执行默认值：上下文窗口 `128000`、最大输出 `16384`、未知价格 `0`。
+如果未配置 SSO 或详情加载失败，模型发现仍会返回 API Key 范围内的模型。OMP 必填数值字段使用明确的执行默认值：上下文窗口 `128000`、最大输出 `16384`、未知价格 `0`。
 
 ### 3. 协议选择与回退
 
@@ -190,7 +190,7 @@ HepAI catalog 价格按 `CNY × 0.143` 换算，在推理进行时作为 USD 临
 | --- | --- |
 | `index.ts` | Provider 注册、模型发现、transport 调度和命令 |
 | `endpoints.ts` | HepAI 规范 URL |
-| `catalog.ts` | 公共 catalog 分页和 OMP 模型元数据映射 |
+| `catalog.ts` | Portal 模型详情增强和 OMP 模型元数据映射 |
 | `capabilities.ts` | 探测请求、分类、transport 顺序和回退规则 |
 | `portal-auth.ts` | 浏览器 SSO、refresh cookie 校验和 JWT 刷新 |
 | `portal-client.ts` | 账单请求和隐私安全的汇总 |

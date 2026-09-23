@@ -26,7 +26,7 @@ All runtime paths use `https://aiapi.ihep.ac.cn`.
 | Method | Path | Authentication | Used by |
 | --- | --- | --- | --- |
 | `GET` | `/apiv2/models` | Model API key | Authoritative accessible model list |
-| `GET` | `/apiv2/portal/model/list_cloud_models?page=<n>&page_size=100` | None | Optional model metadata enrichment |
+| `GET` | `/apiv2/portal/model/cloud_models_details?model_name=<id>` | Portal JWT from SSO | Optional metadata for one accessible model |
 | `POST` | `/apiv2/responses` | Model API key | Responses transport and probe |
 | `POST` | `/apiv2/chat/completions` | Model API key | Chat Completions transport and probe |
 | `POST` | `/apiv2/anthropic/v1/messages` | Model API key | Anthropic transport and probe |
@@ -74,20 +74,20 @@ The extension registers two independent providers:
 | Provider ID | Credential | Purpose |
 | --- | --- | --- |
 | `hepai` | HepAI model API key | Model discovery and inference |
-| `hepai-portal-sso` | Portal refresh cookie and access JWT | Portal billing only |
+| `hepai-portal-sso` | Portal refresh cookie and access JWT | Model-detail metadata and Portal billing |
 
-Credentials are never crossed: the Portal JWT is not sent to inference endpoints, and the model API key is not sent to Portal billing endpoints.
+Credentials are never crossed: the Portal JWT is sent only to Portal endpoints, including model details and billing, while the model API key is sent only to model listing and inference endpoints.
 
 ### 2. Model discovery
 
 OMP calls the provider's dynamic model loader after resolving the `hepai` credential.
 
 1. `GET /apiv2/models` returns the authoritative, API-key-scoped model IDs.
-2. The plugin fetches the public Portal catalog, up to 50 pages of 100 records.
-3. Catalog rows are matched by exact model ID and can add display name, context/output limits, reasoning support, image input, and verified per-million-token prices. Catalog monetary prices are converted from CNY to OMP's USD fields with `× 0.143`.
-4. Only IDs returned by `/models` are exposed. The public catalog never adds inaccessible models.
+2. When the SSO Portal JWT is available, the plugin requests `/portal/model/cloud_models_details?model_name=<id>` for each accessible model ID, with bounded concurrency.
+3. Detail records are matched by exact model ID and can add display name, context/output limits, reasoning support, image input, and verified per-million-token prices. Detail monetary prices are converted from CNY to OMP's USD fields with `× 0.143`.
+4. Only IDs returned by `/models` are exposed. Detail records never add inaccessible models.
 
-If catalog loading fails, discovery still returns the API-key-scoped models. Required OMP numeric fields then use explicit execution defaults: context window `128000`, maximum output `16384`, and unknown prices `0`.
+If SSO is unavailable or detail loading fails, discovery still returns the API-key-scoped models. Required OMP numeric fields then use explicit execution defaults: context window `128000`, maximum output `16384`, and unknown prices `0`.
 
 ### 3. Protocol selection and fallback
 
@@ -190,7 +190,7 @@ HepAI catalog prices are converted with `CNY × 0.143` and remain useful provisi
 | --- | --- |
 | `index.ts` | Provider registration, model discovery, transport dispatch, commands |
 | `endpoints.ts` | Canonical HepAI URLs |
-| `catalog.ts` | Public catalog pagination and OMP model metadata mapping |
+| `catalog.ts` | Portal model-detail enrichment and OMP model metadata mapping |
 | `capabilities.ts` | Probe bodies, classification, transport ordering and fallback rules |
 | `portal-auth.ts` | Browser SSO, refresh-cookie validation and JWT refresh |
 | `portal-client.ts` | Billing requests and privacy-preserving aggregation |

@@ -82,18 +82,32 @@ describe("HepAI catalog mapping", () => {
     expect(cost.total).toBeCloseTo(0.00063504 * 0.143, 16);
   });
 
-  test("paginates the public catalog and indexes exact original IDs", async () => {
+  test("fetches Portal-JWT-protected details for exact original model IDs", async () => {
     const requests: string[] = [];
-    const fetcher = (async (input: URL | RequestInfo) => {
+    const authorizations: (string | null)[] = [];
+    const fetcher = (async (input: URL | RequestInfo, init?: RequestInit) => {
       const url = String(input);
       requests.push(url);
-      const page = new URL(url).searchParams.get("page");
-      return Response.json(page === "1"
-        ? { data: Array.from({ length: 100 }, (_, index) => ({ id: `model-${index}` })), total_pages: 2 }
-        : { data: [{ id: "openai/gpt-5.6-sol" }], total_pages: 2 });
+      authorizations.push(new Headers(init?.headers).get("Authorization"));
+      const id = new URL(url).searchParams.get("model_name");
+      return Response.json({ data: [{ model_name: id, limitations: { context_window: 200_000 } }] });
     }) as typeof fetch;
-    const records = await fetchHepAICatalog(fetcher);
+    const records = await fetchHepAICatalog(["openai/gpt-5.6-sol", "zhipu/glm-5.1"], "portal-jwt", fetcher);
     expect(requests).toHaveLength(2);
+    expect(requests.every(url => url.includes("/portal/model/cloud_models_details?"))).toBe(true);
+    expect(requests.map(url => new URL(url).searchParams.get("model_name"))).toEqual([
+      "openai/gpt-5.6-sol",
+      "zhipu/glm-5.1",
+    ]);
+    expect(authorizations).toEqual(["Bearer portal-jwt", "Bearer portal-jwt"]);
     expect(indexCatalog(records).has("openai/gpt-5.6-sol")).toBe(true);
+  });
+
+  test("maps nested detail limitations", () => {
+    const model = catalogRecordToModelConfig("zhipu/glm-5.1", {
+      limitations: { context_window: 200_000, max_output_tokens: 32_000 },
+    });
+    expect(model.contextWindow).toBe(200_000);
+    expect(model.maxTokens).toBe(32_000);
   });
 });

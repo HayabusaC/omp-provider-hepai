@@ -45,28 +45,37 @@ const PROVIDER = "hepai";
 const API = "hepai-auto";
 const protocolCache = new Map<string, HepAITransport>();
 const completedResponseLinks = new Map<string, HepAIResponseLink>();
+let resolvePortalToken: (() => Promise<string | undefined>) | undefined;
 
 interface HepAIModelRecord { id?: unknown; }
 interface ModelList { data?: unknown; }
 
 async function discover(apiKey: string | undefined): Promise<ProviderModelConfig[]> {
   if (!apiKey) return [];
-  const [response, catalogResult] = await Promise.all([
-    fetch(`${HEPAI_BASE_URL}/models`, {
-      headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
-      signal: AbortSignal.timeout(15_000),
-      redirect: "error",
-    }),
-    fetchHepAICatalog().catch(() => []),
-  ]);
+  const response = await fetch(`${HEPAI_BASE_URL}/models`, {
+    headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
+    signal: AbortSignal.timeout(15_000),
+    redirect: "error",
+  });
   if (!response.ok) throw new Error(`HepAI model discovery failed with HTTP ${response.status}`);
   const json = await response.json() as ModelList;
   if (!Array.isArray(json.data)) throw new Error("HepAI /models returned no data array");
   const ids = json.data
     .map(item => (item && typeof item === "object" ? (item as HepAIModelRecord).id : undefined))
     .filter((id): id is string => typeof id === "string" && id.length > 0);
+  const uniqueIds = [...new Set(ids)];
+  let portalToken: string | undefined;
+  try {
+    portalToken = await resolvePortalToken?.();
+  } catch {
+    // Portal metadata is optional. A stale or unavailable SSO credential must
+    // not hide models authorized by the model API key.
+  }
+  const catalogResult = portalToken
+    ? await fetchHepAICatalog(uniqueIds, portalToken).catch(() => [])
+    : [];
   const catalog = indexCatalog(catalogResult);
-  return [...new Set(ids)].map(id => catalogRecordToModelConfig(id, catalog.get(id)));
+  return uniqueIds.map(id => catalogRecordToModelConfig(id, catalog.get(id)));
 }
 
 function cloneModel(model: Model<Api>, api: "openai-responses" | "openai-completions" | "anthropic-messages"): Model<Api> {
@@ -274,6 +283,10 @@ export default function hepAIProvider(omp: ExtensionAPI): void {
   };
 
   omp.on("session_start", (_event, ctx) => {
+    resolvePortalToken = () => ctx.modelRegistry.getApiKeyForProvider(
+      PORTAL_SSO_PROVIDER,
+      ctx.sessionManager.getSessionId(),
+    );
     activateSettlement(ctx);
     startPortalPreflight(ctx);
   });
