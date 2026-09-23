@@ -8,8 +8,9 @@ import {
   upsertBillingRecord,
   type BillingSettlementRecord,
 } from "./billing-sidecar.ts";
-import { settledUsageCost } from "./billing-types.ts";
+import { settledUsageCost, usageCostFromBilling } from "./billing-types.ts";
 import { findPortalInvocation, PortalHttpError } from "./portal-client.ts";
+import { billingCachePath } from "./billing-cache.ts";
 
 const MAX_ATTEMPTS = 8;
 const RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000, 60_000, 120_000, 300_000, 600_000] as const;
@@ -26,7 +27,7 @@ interface WritableSessionManager extends ReadonlySessionManager {
 
 export interface SettlementContext {
   sessionManager: ReadonlySessionManager;
-  getPortalToken(forceRefresh?: boolean): Promise<string | undefined>;
+  getBillingAccess(forceRefresh?: boolean): Promise<string | undefined>;
   schedule(callback: () => void | Promise<void>, delayMs: number): unknown;
   syncStats?: () => Promise<unknown>;
   findInvocation?: typeof findPortalInvocation;
@@ -36,7 +37,7 @@ export interface SettlementContext {
 function writableManager(manager: ReadonlySessionManager): WritableSessionManager {
   const candidate = manager as Partial<WritableSessionManager>;
   if (typeof candidate.rewriteEntries !== "function") {
-    throw new Error("HepAI settlement requires OMP 18.2.7 SessionManager.rewriteEntries()");
+    throw new Error("HepAI settlement requires SessionManager.rewriteEntries()");
   }
   return manager as WritableSessionManager;
 }
@@ -155,36 +156,49 @@ export class HepAIBillingSettler {
         }));
         return;
       }
-      let token = await this.context.getPortalToken(false);
-      if (!token) {
+      let access = await this.context.getBillingAccess(false);
+      if (!access) {
         await updateBillingRecord(record.sessionFile, record.requestId, current => ({
           ...current,
           status: "pending",
-          lastError: "HepAI Portal SSO is not configured",
+          lastError: "HepAI website SSO is not configured",
           nextAttemptAt: undefined,
         }));
         return;
       }
       let invoice;
       try {
-        invoice = await (this.context.findInvocation ?? findPortalInvocation)(token, {
+        invoice = await (this.context.findInvocation ?? findPortalInvocation)(access, {
           requestId: record.requestId,
           traceId: record.traceId,
           requestedAt: new Date(record.requestedAt),
+          cachePath: billingCachePath(),
         });
       } catch (error) {
         if (!(error instanceof PortalHttpError) || (error.status !== 401 && error.status !== 403)) throw error;
-        token = await this.context.getPortalToken(true);
-        if (!token) throw error;
-        invoice = await (this.context.findInvocation ?? findPortalInvocation)(token, {
+        access = await this.context.getBillingAccess(true);
+        if (!access) throw error;
+        invoice = await (this.context.findInvocation ?? findPortalInvocation)(access, {
           requestId: record.requestId,
           traceId: record.traceId,
           requestedAt: new Date(record.requestedAt),
+          cachePath: billingCachePath(),
         });
       }
       if (!invoice) throw new Error("matching HepAI billing record is not available yet");
-      const { usage, cost, billing } = settledUsageCost(invoice);
+      const entry = matchingAssistantEntry(this.context.sessionManager.getEntries(), record.responseId);
+      const estimatedCost = entry?.type === "message" && entry.message.role === "assistant"
+        ? entry.message.usage.cost : undefined;
+      const { billing } = settledUsageCost(invoice, estimatedCost);
       if (this.context.sessionManager.getSessionFile() !== record.sessionFile) return;
+      const staged = await updateBillingRecord(record.sessionFile, record.requestId, current => ({
+        ...current,
+        invokeId: invoice.invoke_id === undefined ? undefined : String(invoice.invoke_id),
+        attempts,
+        billing,
+      }));
+      if (!staged?.billing) throw new Error("normalized HepAI sidecar billing was not persisted");
+      const { usage, cost } = usageCostFromBilling(staged.billing, estimatedCost);
       const rewrite = await rewriteAssistantUsage(this.context.sessionManager, record.responseId, usage, cost);
       await (this.context.syncStats ?? (() => syncAllSessions({ workers: 1 })))();
       await updateBillingRecord(record.sessionFile, record.requestId, current => ({
@@ -196,7 +210,7 @@ export class HepAIBillingSettler {
         settledAt: now.toISOString(),
         nextAttemptAt: undefined,
         lastError: undefined,
-        billing,
+        billing: staged.billing,
       }));
     } catch (error) {
       const exhausted = attempts >= MAX_ATTEMPTS;

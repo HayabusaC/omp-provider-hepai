@@ -3,11 +3,99 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent";
-import { settledUsageCost } from "../billing-types.ts";
+import { settledUsageCost, usageCostFromBilling } from "../billing-types.ts";
 import { HepAIBillingSettler, responseLink, rewriteAssistantCost, rewriteAssistantUsage } from "../billing-settlement.ts";
 import { billingSidecarPath, readBillingSidecar } from "../billing-sidecar.ts";
+import { PortalHttpError } from "../portal-client.ts";
 
 describe("HepAI authoritative billing settlement", () => {
+  test("maps the live standard invoice without double-counting reasoning or cache tokens", () => {
+    const result = settledUsageCost({
+      invoke_id: 42,
+      original_price: 0.000322,
+      discount_amount: 0.000225,
+      payable_amount: 0.000097,
+      standard_invoke_record: { input_tokens: 33, output_tokens: 16, reasoning_tokens: 16,
+        cache_read_tokens: 8, cache_write_tokens: 2 },
+      billing_basis: { total_discount_rate: 0.5, cost_breakdown: {
+        prompt: { amount: 33, cost: 1 }, completion: { amount: 16, cost: 2 },
+        input_cache_read: { amount: 8, cost: 3 }, input_cache_write: { amount: 2, cost: 4 },
+        internal_reasoning: { amount: 16, cost: 5 },
+      } },
+      remarks: { request_id: "req-live", trace_id: "trace-live" },
+    }, { input: 0.1, output: 0.2, cacheRead: 0.3, cacheWrite: 0.4, total: 1 });
+    expect(result.usage).toEqual({
+      input: 33, output: 32, reasoningTokens: 16, cacheRead: 8, cacheWrite: 2, totalTokens: 75,
+    });
+    expect(result.cost.input).toBeCloseTo(1 * 0.5 * 0.143);
+    expect(result.cost.output).toBeCloseTo(7 * 0.5 * 0.143);
+    expect(result.cost.cacheRead).toBeCloseTo(3 * 0.5 * 0.143);
+    expect(result.cost.cacheWrite).toBeCloseTo(4 * 0.5 * 0.143);
+    expect(result.cost.total).toBeCloseTo(0.000097 * 0.143);
+    expect(result.billing.standard_invoke_record).toMatchObject({ output_tokens: 16, reasoning_tokens: 16 });
+    expect(result.billing.cost_breakdown).toHaveProperty("input_cache_write");
+  });
+
+  test("maps OMP usage exclusively from normalized sidecar billing", () => {
+    const normalized = settledUsageCost({
+      payable_amount: 2,
+      standard_invoke_record: { input_tokens: 3, output_tokens: 5, reasoning_tokens: 7 },
+      billing_basis: { total_discount_rate: 0.5, cost_breakdown: {
+        prompt: { amount: 3, cost: 2 },
+        completion: { amount: 5, cost: 4 },
+        internal_reasoning: { amount: 7, cost: 6 },
+      } },
+    }).billing;
+    const mapped = usageCostFromBilling(normalized);
+    expect(mapped.usage).toEqual({
+      input: 3, output: 12, cacheRead: 0, cacheWrite: 0, reasoningTokens: 7, totalTokens: 15,
+    });
+    expect(mapped.cost.input).toBeCloseTo(2 * 0.143 * 0.5);
+    expect(mapped.cost.output).toBeCloseTo((4 + 6) * 0.143 * 0.5);
+    expect(mapped.cost.total).toBeCloseTo(2 * 0.143);
+  });
+
+  test("falls back through live usage fields when canonical token fields are missing", () => {
+    const result = settledUsageCost({
+      payable_amount: 2, standard_invoke_record: {},
+      billing_basis: { usage: {
+        output_tokens: 7, cache_creation_input_tokens: 11,
+        output_tokens_details: { thinking_tokens: 3 },
+        std_amounts: { prompt: 5, input_cache_read: 13 },
+      } },
+    });
+    expect(result.usage).toEqual({
+      input: 5, output: 10, cacheRead: 13, cacheWrite: 11, reasoningTokens: 3, totalTokens: 39,
+    });
+    expect(result.billing.original_price).toBe(2 * 0.143);
+    expect(result.billing.discount_amount).toBe(0);
+  });
+
+  test("treats omitted groups in a sparse live breakdown as authoritative zero", () => {
+    const result = settledUsageCost({
+      payable_amount: 1,
+      standard_invoke_record: {
+        input_tokens: 12, output_tokens: 4, cache_read_tokens: 0,
+        cache_write_tokens: 7203, reasoning_tokens: 0,
+      },
+      billing_basis: {
+        total_discount_rate: 1,
+        cost_breakdown: {
+          prompt: { amount: 12, cost: 0.1 },
+          completion: { amount: 4, cost: 0.2 },
+          input_cache_write: { amount: 7203, cost: 0.3 },
+        },
+      },
+    }, { input: 9, output: 9, cacheRead: 9, cacheWrite: 9, total: 36 });
+
+    expect(result.cost.input).toBeCloseTo(0.1 * 0.143);
+    expect(result.cost.output).toBeCloseTo(0.2 * 0.143);
+    expect(result.cost.cacheWrite).toBeCloseTo(0.3 * 0.143);
+    expect(result.cost.cacheRead).toBe(0);
+    expect(result.billing.cost_breakdown).not.toHaveProperty("input_cache_read");
+    expect(result.billing.cost_breakdown).not.toHaveProperty("internal_reasoning");
+  });
+
   test("uses payable_amount for total and folds internal reasoning into output", () => {
     const record = {
       invoke_id: 13818596,
@@ -163,7 +251,7 @@ describe("HepAI authoritative billing settlement", () => {
       await manager.rewriteEntries();
       const settler = new HepAIBillingSettler({
         sessionManager: manager,
-        getPortalToken: async () => "jwt",
+        getBillingAccess: async () => "website-token",
         schedule: callback => callbacks.push(callback),
         syncStats: async () => { syncs++; },
         findInvocation: async (_token, options) => {
@@ -171,11 +259,9 @@ describe("HepAI authoritative billing settlement", () => {
           expect(options).toMatchObject({ requestId: "req-worker", traceId: "trace-worker" });
           return {
             invoke_id: 42,
-            total_discount_rate: 0.5,
-            cost_breakdown: {
-              prompt: { amount: 10, cost: 1 },
-              completion: { amount: 6, cost: 1 },
-              internal_reasoning: { amount: 4, cost: 1 },
+            standard_invoke_record: {
+              input_tokens: 10, output_tokens: 10, reasoning_tokens: 4,
+              cache_read_tokens: 0, cache_write_tokens: 0,
             },
             original_price: 3,
             discount_amount: 1.5,
@@ -195,16 +281,19 @@ describe("HepAI authoritative billing settlement", () => {
       });
       expect(stored.records["req-worker"]?.billing?.payable_amount).toBeCloseTo(1.5 * 0.143, 12);
       expect(stored.records["req-worker"]?.billing?.original_price).toBeCloseTo(3 * 0.143, 12);
-      expect((stored.records["req-worker"]?.billing?.cost_breakdown.internal_reasoning as { cost: number }).cost)
-        .toBeCloseTo(1 * 0.143, 12);
+      expect(stored.records["req-worker"]?.billing?.standard_invoke_record).toMatchObject({
+        input_tokens: 10, output_tokens: 10, reasoning_tokens: 4,
+      });
       const settledEntry = manager.getEntries()[0];
       if (settledEntry?.type !== "message" || settledEntry.message.role !== "assistant") {
         throw new Error("expected settled assistant entry");
       }
       expect(settledEntry.message.usage).toMatchObject({
-        input: 10, output: 10, cacheRead: 0, cacheWrite: 0, reasoningTokens: 4, totalTokens: 20,
+        input: 10, output: 14, cacheRead: 0, cacheWrite: 0, reasoningTokens: 4, totalTokens: 24,
       });
       expect(settledEntry.message.usage.cost.total).toBeCloseTo(1.5 * 0.143, 12);
+      expect(settledEntry.message.usage.cost.input).toBe(9);
+      expect(settledEntry.message.usage.cost.output).toBe(9);
       expect(lookups).toBe(1);
       expect(syncs).toBe(1);
 
@@ -213,6 +302,51 @@ describe("HepAI authoritative billing settlement", () => {
       });
       expect(callbacks).toHaveLength(0);
       expect(lookups).toBe(1);
+    } finally {
+      await manager.close();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("retries website billing with a refreshed website token after 401", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "hepai-website-retry-"));
+    const manager = SessionManager.create(dir, dir);
+    const callbacks: Array<() => void | Promise<void>> = [];
+    const refreshFlags: boolean[] = [];
+    const queriedTokens: string[] = [];
+    try {
+      manager.appendMessage({
+        role: "assistant", content: [], api: "openai-responses", provider: "hepai", model: "deepseek/test",
+        responseId: "resp-retry", usage: {
+          input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        }, stopReason: "stop", timestamp: Date.now(),
+      });
+      await manager.rewriteEntries();
+      const settler = new HepAIBillingSettler({
+        sessionManager: manager,
+        getBillingAccess: async forceRefresh => {
+          refreshFlags.push(forceRefresh ?? false);
+          return forceRefresh ? "new-website-token" : "old-website-token";
+        },
+        schedule: callback => callbacks.push(callback),
+        syncStats: async () => {},
+        findInvocation: async token => {
+          queriedTokens.push(token);
+          if (token === "old-website-token") throw new PortalHttpError("invoke records", 401);
+          return {
+            invoke_id: "invoice-retry", original_price: 2, discount_amount: 1, payable_amount: 1,
+            standard_invoke_record: { input_tokens: 1, output_tokens: 1 },
+            remarks: { request_id: "req-retry" },
+          };
+        },
+      });
+      await settler.register("resp-retry", { requestId: "req-retry", requestedAt: "2026-09-23T00:00:00.000Z" });
+      await callbacks.shift()?.();
+      expect(refreshFlags).toEqual([false, true]);
+      expect(queriedTokens).toEqual(["old-website-token", "new-website-token"]);
+      const stored = await readBillingSidecar(billingSidecarPath(manager.getSessionFile()!));
+      expect(stored.records["req-retry"]).toMatchObject({ status: "settled", invokeId: "invoice-retry" });
     } finally {
       await manager.close();
       await rm(dir, { recursive: true, force: true });

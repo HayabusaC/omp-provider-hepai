@@ -3,3 +3,7 @@ node_modules/
 .env
 .DS_Store
 coverage/
+.tmp/
+.hepai-invoice-cache.json
+*.hepai-billing.json
+debug.log

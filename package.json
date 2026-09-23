@@ -1,6 +1,6 @@
 {
   "name": "omp-provider-hepai",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "HepAI provider with live model discovery and protocol diagnostics for OMP.",
   "type": "module",
   "license": "MIT",
@@ -10,28 +10,71 @@
     "url": "git+https://github.com/HayabusaC/omp-provider-hepai.git"
   },
   "homepage": "https://github.com/HayabusaC/omp-provider-hepai#readme",
-  "bugs": { "url": "https://github.com/HayabusaC/omp-provider-hepai/issues" },
-  "keywords": ["oh-my-pi", "omp", "hepai", "llm-provider"],
-  "publishConfig": { "access": "public" },
+  "bugs": {
+    "url": "https://github.com/HayabusaC/omp-provider-hepai/issues"
+  },
+  "keywords": [
+    "oh-my-pi",
+    "omp",
+    "hepai",
+    "llm-provider"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "build": "tsc --noEmit"
   },
-  "omp": { "extensions": ["./index.ts"] },
+  "omp": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "settings": {
+      "filterSpecificModels": {
+        "type": "boolean",
+        "default": true,
+        "description": "Exclude HepAI Specific models matched by the documented case-insensitive ID keywords."
+      },
+      "filterAgentModels": {
+        "type": "boolean",
+        "default": true,
+        "description": "Exclude HepAI Agent models matched by the documented case-insensitive ID keywords."
+      }
+    }
+  },
   "peerDependencies": {
-    "@oh-my-pi/pi-ai": "^18.2.7",
-    "@oh-my-pi/pi-catalog": "^18.2.7",
-    "@oh-my-pi/pi-coding-agent": "^18.2.7",
-    "@oh-my-pi/omp-stats": "^18.2.7"
+    "@oh-my-pi/omp-stats": "^18.2.10",
+    "@oh-my-pi/pi-ai": "^18.2.10",
+    "@oh-my-pi/pi-catalog": "^18.2.10",
+    "@oh-my-pi/pi-coding-agent": "^18.2.10",
+    "@oh-my-pi/pi-utils": "^18.2.10"
   },
   "devDependencies": {
-    "@oh-my-pi/pi-ai": "18.2.7",
-    "@oh-my-pi/pi-catalog": "18.2.7",
-    "@oh-my-pi/pi-coding-agent": "18.2.7",
-    "@oh-my-pi/omp-stats": "18.2.7",
+    "@oh-my-pi/omp-stats": "18.2.10",
+    "@oh-my-pi/pi-ai": "18.2.10",
+    "@oh-my-pi/pi-catalog": "18.2.10",
+    "@oh-my-pi/pi-coding-agent": "18.2.10",
+    "@oh-my-pi/pi-utils": "18.2.10",
     "@types/bun": "^1.3.14",
     "typescript": "^5.9.3"
   },
-  "files": ["index.ts", "capabilities.ts", "catalog.ts", "endpoints.ts", "portal-auth.ts", "portal-client.ts", "billing-types.ts", "billing-sidecar.ts", "billing-settlement.ts", "README.md", "README.zh-CN.md", "LICENSE"]
+  "files": [
+    "index.ts",
+    "capabilities.ts",
+    "catalog.ts",
+    "endpoints.ts",
+    "website-auth.ts",
+    "website-browser-session.ts",
+    "portal-client.ts",
+    "billing-types.ts",
+    "billing-cache.ts",
+    "transport-cache.ts",
+    "billing-sidecar.ts",
+    "billing-settlement.ts",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ]
 }

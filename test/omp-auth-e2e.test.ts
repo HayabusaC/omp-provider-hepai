@@ -5,7 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { AuthStorage } from "@oh-my-pi/pi-ai";
 
 const liveDescribe = process.env.HEPAI_E2E === "1" && process.env.HEPAI_API_KEY ? describe : describe.skip;
-const ompExe = "C:\\Users\\Shen Chenye\\.bun\\bin\\omp.exe";
+const ompExe = process.env.OMP_BIN || "omp";
 const pluginEntry = join(import.meta.dir, "..", "index.ts");
 
 async function runOMP(args: string[], configRoot: string, agentDir: string) {
