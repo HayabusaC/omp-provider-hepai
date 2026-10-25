@@ -33,12 +33,14 @@ describe("HepAI catalog mapping", () => {
   });
 
   test("exempts exact model IDs and uses the suffix after the slash as their display name", () => {
-    expect(hasDisplayName({ display_name: "{}" }, "aliyun/qwen3.8-max")).toBe(true);
+    expect(hasDisplayName({ display_name: "{}" }, "anthropic/claude-fable-5-1")).toBe(true);
     expect(hasDisplayName({ display_label: "null" }, "moonshot/kimi-k3")).toBe(true);
-    expect(catalogRecordToModelConfig("aliyun/qwen3.8-max", { display_name: "{}" }).name).toBe("qwen3.8-max");
+    expect(catalogRecordToModelConfig("anthropic/claude-fable-5-1", { display_name: "{}" }).name).toBe("claude-fable-5-1");
     expect(catalogRecordToModelConfig("moonshot/kimi-k3", { display_label: "null" }).name).toBe("kimi-k3");
-    expect(hasDisplayName({ display_name: "{}" }, "Metadata_completion_model")).toBe(true);
-    expect(catalogRecordToModelConfig("Metadata_completion_model", { display_name: "{}" }).name).toBe("Metadata_completion_model");
+    expect(hasDisplayName({ display_name: "{}" }, "aliyun/qwen3.8-max")).toBe(false);
+    expect(hasDisplayName({ display_name: "{}" }, "Metadata_completion_model")).toBe(false);
+    expect(hasDisplayName({ display_label: "{}" }, "other/claude-fable-5-1")).toBe(false);
+    expect(hasDisplayName({ display_label: "{}" }, "Anthropic/claude-fable-5-1")).toBe(false);
     expect(hasDisplayName({ display_name: "{}" }, "other/kimi-k3")).toBe(false);
   });
 
@@ -57,13 +59,12 @@ describe("HepAI catalog mapping", () => {
     ]);
   });
 
-  test("keeps exact global exemptions through demo and duplicate filtering", () => {
-    expect(excludeDemoModels(["Metadata_completion_model", "demo-model"])).toEqual(["Metadata_completion_model"]);
+  test("keeps current exemptions and removes the former unqualified exemption", () => {
+    expect(excludeDemoModels(["moonshot/kimi-k3", "anthropic/claude-fable-5-1", "demo-model"])).toEqual(["moonshot/kimi-k3", "anthropic/claude-fable-5-1"]);
     expect(excludeUnqualifiedAliases([
       "Metadata_completion_model",
       "HepAI/Metadata_completion_model",
     ])).toEqual([
-      "Metadata_completion_model",
       "HepAI/Metadata_completion_model",
     ]);
   });

@@ -132,7 +132,7 @@ OMP 解析 `hepai` 凭据后调用 provider 的动态模型加载器。
 1. 读取 `/apiv2/models`；成功时只允许注册该响应 `data[].id` 中的模型。该请求失败时，改用云模型列表的 `model_name → id`。
 2. 对候选 ID 去重，然后在执行任何过滤之前为每个候选 ID 请求网站详情。详情响应必须按 `id` 或 `model_name` 与请求 ID 精确匹配，不能引入候选列表以外的模型。
 3. 同一 ID 的记录按云模型列表 → 网站详情 → `/apiv2/models` 顺序合并，后者的非 `null`、非 `undefined`、非空字符串字段覆盖前者；显示名字段还会把占位字符串视为空值，不能覆盖低优先级来源中的有效名称。这是字段级浅合并，嵌套对象不做递归合并。
-4. 对合并结果依次执行五轮过滤：无有效显示名 → ID 含 `demo` → 无斜杠重复 ID → Specific → Agent。精确 ID `aliyun/qwen3.8-max`、`moonshot/kimi-k3` 和 `Metadata_completion_model` 豁免前三轮过滤，但不豁免 Specific 或 Agent 过滤；后两轮由开关控制且默认开启。
+4. 对合并结果依次执行五轮过滤：无有效显示名 → ID 含 `demo` → 无斜杠重复 ID → Specific → Agent。精确 ID `moonshot/kimi-k3` 和 `anthropic/claude-fable-5-1` 豁免前三轮过滤，但不豁免 Specific 或 Agent 过滤；后两轮由开关控制且默认开启。
 5. 无论后两个开关实际是否关闭，另行按 Specific、Agent 均开启计算“完整五轮过滤存活集”。只有这个集合中的模型才执行下表的 Context/Max output fallback 和 K-token 单位修正。因关闭后两个开关才重新出现的模型保留原始数值。
 6. 将实际可见模型映射为 `ProviderModelConfig`，再按 provider 分组、显示名自然排序、ID 破同名并列，最后由 `fetchDynamicModels` 返回给 OMP。
 

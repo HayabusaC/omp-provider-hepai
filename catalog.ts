@@ -96,9 +96,8 @@ function rate(primary: unknown, fallback: unknown, discountRate: number): number
 
 const INVALID_DISPLAY_NAMES = new Set(["", "{}", "[]", "null", "undefined"]);
 const GLOBAL_FILTER_ID_EXEMPTIONS = new Set([
-  "aliyun/qwen3.8-max",
   "moonshot/kimi-k3",
-  "Metadata_completion_model",
+  "anthropic/claude-fable-5-1",
 ]);
 export const SPECIFIC_MODEL_KEYWORDS = [
   "BOSS", "COMET", "Reconstruct", "Sensor", "HXMT", "simulation", "NRS", "XRD",
